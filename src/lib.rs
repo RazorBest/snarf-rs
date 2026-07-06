@@ -125,6 +125,22 @@ impl<NetHandler: NetworkSnarfHandler> SnarfNfqNet<NetHandler>
         }
     }
 
+    fn get_next_msg_blocking(&mut self) -> Result<nfq::Message, Box<dyn Error>> {
+        loop {
+            match self.queue.recv() {
+                Ok(msg) => {
+                    return Ok(msg);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    panic!("queue would block");
+                }
+                Err(err) => {
+                    return Err(err.into());
+                }
+            }
+        }
+    }
+
     async fn verdict(&mut self, msg: nfq::Message) -> Result<(), Box<dyn Error>> {
         let mut _guard = self.async_fd.writable().await?;
 
@@ -132,6 +148,10 @@ impl<NetHandler: NetworkSnarfHandler> SnarfNfqNet<NetHandler>
             Ok(msg) => Ok(msg),
             Err(err) => Err(err.into()),
         }
+    }
+
+    fn verdict_blocking(&mut self, msg: nfq::Message) -> Result<(), Box<dyn Error>> {
+        Ok(self.queue.verdict(msg)?)
     }
 
     async fn wait_for_verdict(
@@ -344,291 +364,3 @@ impl<NetAddr: Copy + Hash + Ord + Default, AH: ApplicationDataSnarfHandler> Tran
 
 // type struct SnarfIpv4Tcp<AH: ApplicationDataSnarfHandler> = SnarfTcp<AH: ApplicationDataSnarfHandler, Ipv4Type>
 pub type SnarfIpv4Tcp<AH> = SnarfTcp<AH, Ipv4Type>;
-
-/*
-pub struct Interceptor<TcpHandler>
-where
-    TcpHandler: TcpPacketInterceptorHandler
-{
-    queue: nfq::Queue,
-    async_fd: AsyncFd<RawFd>,
-    iface_ip: Vec<u8>,
-    tcp_handler: TcpHandler,
-
-    last_time_printed_stats: Instant,
-    total_latency: Duration,
-    msg_received: u64,
-    latency_sec1: Duration,
-    latency_sec2: Duration,
-    latency_sec3: Duration,
-    latency_sec4: Duration,
-    cnt_sec3: u64,
-}
-
-impl<TcpHandler> Interceptor<TcpHandler>
-where
-    TcpHandler: TcpPacketInterceptorHandler
-{
-    fn new(opts: &InterceptorOptions, iface_ip: Vec<u8>, tcp_handler: TcpHandler) -> Result<Self, Box<dyn Error>> {
-        let mut queue = nfq::Queue::open()?;
-        queue.bind(opts.queue_num)?;
-        queue.set_nonblocking(true);
-
-        let async_fd = AsyncFd::new(queue.as_raw_fd())?;
-
-        Ok(Self {
-            queue,
-            async_fd,
-            iface_ip,
-            tcp_handler,
-            last_time_printed_stats: Instant::now(),
-            total_latency: Duration::ZERO,
-            msg_received: 0,
-            latency_sec1: Duration::ZERO,
-            latency_sec2: Duration::ZERO,
-            latency_sec3: Duration::ZERO,
-            latency_sec4: Duration::ZERO,
-            cnt_sec3: 0,
-        })
-    }
-
-    async fn get_next_msg(&mut self) -> Result<nfq::Message, Box<dyn Error>> {
-        loop {
-            let mut guard = self.async_fd.readable().await?;
-
-            match self.queue.recv() {
-                Ok(msg) => {
-                    return Ok(msg);
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    guard.clear_ready();
-                }
-                Err(err) => {
-                    panic!("Err: {err}");
-                    return Err(err.into());
-                }
-            }
-        }
-    }
-
-    fn get_next_msg_blocking(&mut self) -> Result<nfq::Message, Box<dyn Error>> {
-        loop {
-            match self.queue.recv() {
-                Ok(msg) => {
-                    return Ok(msg);
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    panic!("queue would block");
-                }
-                Err(err) => {
-                    return Err(err.into());
-                }
-            }
-        }
-    }
-
-    async fn verdict(&mut self, msg: nfq::Message) -> Result<(), Box<dyn Error>> {
-        let mut _guard = self.async_fd.writable().await?;
-
-        match self.queue.verdict(msg) {
-            Ok(msg) => Ok(msg),
-            Err(err) => Err(err.into()),
-        }
-    }
-
-    fn verdict_blocking(&mut self, msg: nfq::Message) -> Result<(), Box<dyn Error>> {
-        Ok(self.queue.verdict(msg)?)
-    }
-
-    async fn wait_for_verdict(
-        &mut self,
-        running: Arc<AtomicBool>,
-        msg: nfq::Message,
-    ) -> Result<(), Box<dyn Error>> {
-        tokio::select! {
-            ret = self.verdict(msg) => {
-                ret?;
-            },
-            _ = tokio::spawn(async move {
-                while running.load(Ordering::SeqCst) {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                }
-            }) => (),
-        }
-
-        Ok(())
-    }
-
-    async fn live_intercept(&mut self, running: Arc<AtomicBool>) -> Result<(), Box<dyn Error>> {
-        while running.load(Ordering::SeqCst) {
-            let running_clone = running.clone();
-            let while_running = async move {
-                while running_clone.load(Ordering::SeqCst) {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                }
-            };
-            let mut msg = tokio::select! {
-                msg = self.get_next_msg() => {
-                    msg
-                },
-                _ = tokio::spawn(while_running) => {
-                    // Trigger when `running` is set to false
-                    return Ok(());
-                },
-            }?;
-
-            let start_t = Instant::now();
-
-            {
-                let payload_len = msg.get_payload().len();
-                let original_len = msg.get_original_len();
-                if payload_len != original_len {
-                    println!("len / original: {} / {}", payload_len, original_len);
-                    panic!("Packet was truncated");
-                }
-            }
-
-            let ip_payload = msg.get_payload_mut();
-
-            let verdict: InterceptVerdict = self.on_packet(ip_payload);
-            match verdict {
-                InterceptVerdict::Accept => {
-                    msg.set_verdict(nfq::Verdict::Accept);
-                }
-                InterceptVerdict::Drop => {
-                    msg.set_verdict(nfq::Verdict::Drop);
-                }
-            }
-
-            if Instant::now().duration_since(self.last_time_printed_stats) > Duration::from_secs(10) {
-                let curr = Instant::now();
-                self.last_time_printed_stats = curr;
-                println!("total_latency: {:.1} ms", self.total_latency.as_millis());
-                println!("msg_received: {:.1}", self.msg_received);
-                println!("total_latency/msg: {:.4} us", (self.total_latency.as_micros() as f64) / (self.msg_received as f64));
-                println!("latency_sec1/mgs: {:.4} us", (self.latency_sec1.as_micros() as f64) / (self.msg_received as f64));
-                println!("latency_sec2/mgs: {:.4} us", (self.latency_sec2.as_micros() as f64) / (self.msg_received as f64));
-                println!("latency_sec4/mgs: {:.4} us", (self.latency_sec4.as_micros() as f64) / (self.msg_received as f64));
-            }
-
-            self.msg_received += 1;
-            let delta = Instant::now().duration_since(start_t);
-            self.total_latency += delta;
-
-            self.wait_for_verdict(running.clone(), msg).await.unwrap();
-        }
-
-        Ok(())
-    }
-
-    fn on_packet(&mut self, ip_payload: &mut [u8]) -> InterceptVerdict {
-        // TODO: One drawback with these rules is that they don't catch the first SYN packet of an inbound connection.
-        let Ok(parsed) = SlicedPacket::from_ip(&ip_payload) else {
-            return InterceptVerdict::Accept;
-        };
-
-        let (src_ip, dst_ip, ip_header_size) = match &parsed.net {
-            Some(Ipv4(ip)) => {
-                let header = ip.header();
-
-                (
-                    header.source(),
-                    header.destination(),
-                    (header.ihl() * 4) as usize,
-                )
-            }
-            Some(Ipv6(..)) => {
-                panic!("IPv6 is not supported");
-            }
-            _ => {
-                panic!("Non-IP packet");
-            }
-        };
-
-        drop(parsed);
-        let verdict = self.on_tcp_packet(src_ip, dst_ip, &mut ip_payload[ip_header_size..]);
-
-        let new_checksum = ipv4_checksum(
-            &ip_payload[ip_header_size..],
-            ip_payload[12..16].try_into().unwrap(),
-            ip_payload[16..20].try_into().unwrap(),
-        );
-        ip_payload[ip_header_size + 16..ip_header_size + 18]
-            .copy_from_slice(&new_checksum.to_be_bytes());
-
-        return verdict;
-    }
-
-    /*
-    fn on_tcp_packet<TcpHandler>(
-        &mut self,
-        src_ip: [u8; 4],
-        dst_ip: [u8; 4],
-        tcp_payload: &mut [u8],
-    )
-    where
-        TcpHandler: TcpPacketInterceptorHandler<T>
-    {
-        // TcpHandler::on_tcp_packet(self, src_ip, dst_ip, tcp_payload);
-        self.tcp_handler.on_tcp_packet(self, src_ip, dst_ip, tcp_payload);
-    }
-    */
-    fn on_tcp_packet(
-        &mut self,
-        src_ip: [u8; 4],
-        dst_ip: [u8; 4],
-        tcp_payload: &mut [u8],
-    ) -> InterceptVerdict
-    {
-        // TcpHandler::on_tcp_packet(self, src_ip, dst_ip, tcp_payload);
-        self.tcp_handler.on_tcp_packet(self, src_ip, dst_ip, tcp_payload)
-    }
-
-    fn on_data(&mut self, is_client: bool, data: &mut [u8]) -> InterceptVerdict {
-        InterceptVerdict::Accept
-    }
-}
-*/
-
-/*
-pub async fn async_run_interceptor(
-    opts: &InterceptorOptions,
-    running: Arc<AtomicBool>,
-    iface_ip: Vec<u8>,
-    pcap_buffer: Producer<PcapPacket>,
-) -> Result<(), Box<dyn Error>> {
-    let mut interceptor = Interceptor::new(opts, iface_ip, pcap_buffer)?;
-
-    interceptor.live_intercept(running).await
-}
-
-pub fn run_program(
-    interceptor_opts: InterceptorOptions,
-    dumper_opts: DumperOptions,
-    running: Arc<AtomicBool>,
-    iface_ip: Vec<u8>,
-) -> Result<(), Box<dyn Error>> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let (producer, consumer) = RingBuffer::new(PCAP_BUFFER_SIZE);
-
-    let running_clone = running.clone();
-    let dumper_thread = rt.spawn_blocking(move || run_dumper(&dumper_opts, running_clone, consumer));
-    /*
-    let interceptor_task = rt.spawn(async move {
-    });
-
-    let local = tokio::task::LocalSet::new();
-    let interceptor_task = rt.spawn(async move {
-        local.run_until(async {
-            tokio::task::spawn_local(async_run_interceptor(&interceptor_opts, running, iface_ip, producer)).await.unwrap();
-        }).await;
-    });
-    */
-    
-    rt.block_on(async_run_interceptor(&interceptor_opts, running, iface_ip, producer))?;
-    // rt.block_on(interceptor_task).unwrap();
-    rt.block_on(dumper_thread).unwrap();
-
-    Ok(())
-}
-*/
