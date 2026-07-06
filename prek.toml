@@ -1,0 +1,30 @@
+[[repos]]
+repo = "builtin"
+hooks = [
+  { id = "check-yaml" },
+  { id = "check-added-large-files" },
+  { id = "mixed-line-ending" },
+]
+
+[[repos]]
+repo = "local"
+hooks = [
+  {
+    id = "cargo-fmt",
+    name = "Cargo Format",
+    language = "system",
+    description = "Check Rust code formatting",
+    entry = "cargo fmt --all --check",
+    types = ["rust"],
+    pass_filenames = false,
+  },
+  {
+    id = "cargo-clippy",
+    name = "Cargo Clippy",
+    language = "system",
+    description = "Lint Rust code",
+    entry = "cargo clippy --all-targets --all-features -- -D warnings",
+    types = ["rust"],
+    pass_filenames = false,
+  },
+]
