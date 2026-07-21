@@ -22,9 +22,9 @@ checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
 name = "bytes"
-version = "1.12.0"
+version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
+checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cfg-if"
@@ -101,7 +101,7 @@ dependencies = [
 [[package]]
 name = "nfq"
 version = "0.2.6"
-source = "git+https://github.com/RazorBest/nfq-rs.git#568a8e63d29a614e267dff61c829598fcb8d42f6"
+source = "git+https://github.com/RazorBest/nfq-rs.git#8c9a1138c796792e3929fc5f3e8b9bccec12f996"
 dependencies = [
  "bytes",
  "libc",
@@ -217,6 +217,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 name = "snarf-rs"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "etherparse",
  "nfq",
  "nix",
