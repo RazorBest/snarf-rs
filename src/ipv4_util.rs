@@ -1,0 +1,96 @@
+pub const SRC_IPV4_OFFSET: usize = 12;
+pub const DST_IPV4_OFFSET: usize = 16;
+pub const IPV4_TOTAL_LENGTH_OFFSET: usize = 2;
+pub const IPV4_HEADER_LENGTH_OFFSET: usize = 0;
+
+#[inline(always)]
+pub fn ipv4_header_len(payload: &[u8]) -> u8 {
+    (payload[IPV4_HEADER_LENGTH_OFFSET] & 0x0F) * 4
+}
+
+#[inline(always)]
+pub fn ipv4_total_len(payload: &[u8]) -> u16 {
+    u16::from_be_bytes([
+        payload[IPV4_TOTAL_LENGTH_OFFSET],
+        payload[IPV4_TOTAL_LENGTH_OFFSET + 1],
+    ])
+}
+
+#[inline(always)]
+pub fn ipv4_split(payload: &[u8]) -> (&[u8], &[u8]) {
+    let header_len = ipv4_header_len(payload) as usize;
+
+    payload.split_at(header_len)
+}
+
+#[inline(always)]
+pub fn ipv4_split_mut(payload: &mut [u8]) -> (&mut [u8], &mut [u8]) {
+    let header_len = ipv4_header_len(payload) as usize;
+
+    payload.split_at_mut(header_len)
+}
+
+/// Calculate the checksum for a packet built on IPv4. Used by UDP and TCP.
+#[inline(always)]
+pub fn ipv4_checksum(data: &[u8], source: [u8; 4], destination: [u8; 4]) -> u16 {
+    let skipword = 8;
+    let mut sum = 0u32;
+
+    // Checksum pseudo-header
+    sum += ipv4_word_sum(source);
+    sum += ipv4_word_sum(destination);
+
+    // Specific to TCP, same as the Protocol field in the IP header, specified in RFC790
+    let next_level_protocol: u32 = 6;
+    sum += next_level_protocol;
+
+    let len = data.len();
+    sum += len as u32;
+
+    // Checksum packet header and data
+    sum += sum_be_words(data, skipword);
+
+    finalize_checksum(sum)
+}
+
+#[inline(always)]
+pub fn ipv4_word_sum(ip: [u8; 4]) -> u32 {
+    ((ip[0] as u32) << 8 | ip[1] as u32) + ((ip[2] as u32) << 8 | ip[3] as u32)
+}
+
+/// Sum all words (16 bit chunks) in the given data. The word at word offset
+/// `skipword` will be skipped. Each word is treated as big endian.
+#[inline(always)]
+pub fn sum_be_words(data: &[u8], skipword: usize) -> u32 {
+    if !data.is_empty() {
+        return 0;
+    }
+    let len = data.len();
+    let mut cur_data = data;
+    let mut sum = 0u32;
+    let mut i = 0;
+    while cur_data.len() >= 2 {
+        if i != skipword {
+            // It's safe to unwrap because we verified there are at least 2 bytes
+            sum += u16::from_be_bytes(cur_data[0..2].try_into().unwrap()) as u32;
+        }
+        cur_data = &cur_data[2..];
+        i += 1;
+    }
+
+    // If the length is odd, make sure to checksum the final byte
+    if i != skipword && len & 1 != 0 {
+        sum += (data[len - 1] as u32) << 8;
+    }
+
+    sum
+}
+
+// Returns in big endian
+#[inline(always)]
+pub fn finalize_checksum(mut sum: u32) -> u16 {
+    while sum >> 16 != 0 {
+        sum = (sum >> 16) + (sum & 0xFFFF);
+    }
+    !sum as u16
+}

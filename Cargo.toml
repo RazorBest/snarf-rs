@@ -1,0 +1,15 @@
+[package]
+name = "snarf-rs"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "snarf"
+path = "src/lib.rs"
+
+[dependencies]
+bytes = "1.12.1"
+nix = { version = "0.31.3", features = ["net"] }
+nfq = { git = "https://github.com/RazorBest/nfq-rs.git", version = "0.2.6" }
+etherparse = "0.19.0"
+tokio = { version = "1.52.3", features = ["full", "rt"] }
