@@ -309,7 +309,6 @@ where
 {
     fn on_payload(&mut self, mut rf: nfq::Message) -> Vec<SnarfInterceptVerdict<nfq::Message>> {
         let payload = rf.get_payload_mut();
-        // TODO: One drawback with these rules is that they don't catch the first SYN packet of an inbound connection.
         let Ok(parsed) = SlicedPacket::from_ip(payload) else {
             return vec![SnarfInterceptVerdict::Accept(rf)];
         };
