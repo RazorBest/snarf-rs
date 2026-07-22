@@ -197,7 +197,6 @@ where
             self.buffer.set_seq(next_seq);
             self.buffer.seq_add(1);
             self.fin = true;
-            // TODO: What if the packet has payload?
             return Ok((0, None, None));
         }
 
