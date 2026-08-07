@@ -1,4 +1,6 @@
 use crate::deque::DequeSliceMut;
+use crate::ipv4_util::ipv4_header_len;
+use crate::tcp_util::update_checksum_tcp_ipv4;
 
 pub const SEQ_LIM: i64 = u32::MAX as i64 + 1;
 
