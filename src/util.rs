@@ -125,3 +125,9 @@ impl CircularSeqBuffer {
         write_space.copy_from_slice(data);
     }
 }
+
+pub fn update_checksum_ipv4_tcp_packet(ip_packet: &mut [u8]) {
+    let ip_len = ipv4_header_len(ip_packet) as usize;
+    let (ip_header, tcp_payload) = ip_packet.split_at_mut(ip_len);
+    update_checksum_tcp_ipv4(ip_header, tcp_payload);
+}
