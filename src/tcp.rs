@@ -184,7 +184,7 @@ where
         data: &mut [u8],
     ) -> Result<TcpTrackerUpdateResult<'a>> {
         if (flags & SYN_MASK) != 0 && !self.first_seq {
-            self.buffer.set_seq(next_seq);
+            self.buffer.seq = next_seq;
             self.buffer.seq_add(1);
             self.first_seq = true;
 

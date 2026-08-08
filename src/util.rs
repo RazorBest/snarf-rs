@@ -20,10 +20,6 @@ impl CircularSeqBuffer {
         }
     }
 
-    pub fn set_seq(&mut self, seq: u32) {
-        self.seq = seq;
-    }
-
     pub fn seq_add(&mut self, increment: u32) {
         self.seq = self.seq.wrapping_add(increment);
     }
