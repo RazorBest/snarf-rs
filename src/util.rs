@@ -36,7 +36,7 @@ impl CircularSeqBuffer {
         (1..=self.len() as i64).contains(&diff)
     }
 
-    pub fn get_new(&mut self, next_seq: u32, data_len: usize) -> i64 {
+    pub fn get_new(&self, next_seq: u32, data_len: usize) -> i64 {
         let mut new_data_len = (next_seq as i64 + data_len as i64 - (self.seq as i64)) % SEQ_LIM;
         if (new_data_len + self.len() as i64) % SEQ_LIM < self.len() as i64 {
             new_data_len = 0;
