@@ -148,6 +148,7 @@ where
         let mut queue = nfq::Queue::open()?;
         queue.bind(opts.queue_num)?;
         queue.set_nonblocking(true);
+        queue.set_copy_range(opts.queue_num, u16::MAX)?;
 
         let async_fd = AsyncFd::new(queue.as_raw_fd())?;
 

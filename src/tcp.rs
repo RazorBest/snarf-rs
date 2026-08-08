@@ -14,7 +14,7 @@ pub const TCP_SRCPORT_OFFSET: usize = 0;
 pub const TCP_DSTPORT_OFFSET: usize = 2;
 pub const SEQ_LIM: i64 = u32::MAX as i64 + 1;
 
-const BUFFER_SIZE: usize = 32768;
+const BUFFER_SIZE: usize = 65535 * 16;
 
 #[derive(Debug, Clone)]
 pub enum SnarfTcpError {
