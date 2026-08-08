@@ -92,6 +92,7 @@ where
         }
     }
 
+    /// Returns the data referenced by the verdict.
     pub fn get_data(&mut self) -> &[u8] {
         let (_, tcp_payload) = self.rf.split();
 
@@ -119,6 +120,7 @@ where
     }
 }
 
+/// (Retramsitted, Write buffer, Retransmission copy)
 pub type TcpTrackerUpdateResult<'a> = (
     usize,
     Option<DequeSliceMut<'a, u8>>,
@@ -151,10 +153,16 @@ where
         }
     }
 
+    /// Returns the SEQ of the next expected byte
     pub fn seq(&self) -> u32 {
         self.buffer.seq
     }
 
+    /// Updates the peer state given the TCP flags, the SEQ from the header and
+    /// the data from the payload.
+    ///
+    /// If the data contains retransmitted bytes, they are overwritten with the ones from the
+    /// peer buffer.
     pub fn update<'a>(
         &'a mut self,
         flags: u8,
@@ -174,7 +182,7 @@ where
         let buffer_len = self.buffer.len() as i64;
         /*
          * S = seq of the first byte still available in the window
-         * E = self.seq = seq of the first byte outside the window
+         * E = self.buffer.seq = seq of the first byte outside the window
          * X1 = next_seq = seq of the next packet
          * X2 = X1 + length of the data payload
          *
@@ -235,7 +243,7 @@ where
             return Ok((data_len as usize, None, None));
         }
 
-        // X1 <= E
+        // X1 <= E, otherwise it's future
         let old_data_len = data_len - new_data_len;
         if !(0..=buffer_len).contains(&old_data_len) {
             return Ok((0, None, None));
@@ -270,6 +278,11 @@ where
         ))
     }
 
+    /// Pulls packets from the future queue, if they are not futures anymore.
+    ///
+    /// A future packet is a packet whose SEQ is strictly greater than the
+    /// expected SEQ for the peer. Future packets can be pulled from the queue
+    /// after an `update` call that provides the missing bytes before the future.
     pub fn update_future_queue<'a>(&'a mut self) -> Vec<FutureVerdict<'a, RF>> {
         let start_end = self.buffer.end;
 
