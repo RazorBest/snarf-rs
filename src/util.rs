@@ -78,25 +78,24 @@ impl CircularSeqBuffer {
 
     pub fn update_and_return_split_ref<'a>(
         &'a mut self,
-        data_len: usize,
+        count: usize,
     ) -> (DequeSliceMut<'a, u8>, DequeSliceMut<'a, u8>) {
         /*
          * Assumptions: seq == self.end_seq
          * data_len <= self.buffer.len(
          * */
-        let buffer_len = self.len() as u32;
         let old_end = self.end as usize;
 
-        self.seq = self.seq.wrapping_add(data_len as u32);
+        self.seq = self.seq.wrapping_add(count as u32);
 
-        self.end += data_len as u32;
-        if self.end >= buffer_len {
-            self.end -= buffer_len;
+        self.end += count as u32;
+        if self.end >= self.len() as u32 {
+            self.end -= self.len() as u32;
         }
 
         let buffer = DequeSliceMut::from_slice_mut_start_at(&mut self.buffer, old_end);
 
-        buffer.split_mut(data_len)
+        buffer.split_mut(count)
     }
 
     pub fn update(&mut self, data_len: usize) {
