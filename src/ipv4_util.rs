@@ -16,6 +16,18 @@ pub fn ipv4_total_len(payload: &[u8]) -> u16 {
     ])
 }
 
+pub fn ipv4_src_ip(payload: &[u8]) -> [u8; 4] {
+    payload[SRC_IPV4_OFFSET..SRC_IPV4_OFFSET + 4]
+        .try_into()
+        .unwrap()
+}
+
+pub fn ipv4_dst_ip(payload: &[u8]) -> [u8; 4] {
+    payload[DST_IPV4_OFFSET..DST_IPV4_OFFSET + 4]
+        .try_into()
+        .unwrap()
+}
+
 #[inline(always)]
 pub fn ipv4_split(payload: &[u8]) -> (&[u8], &[u8]) {
     let header_len = ipv4_header_len(payload) as usize;
