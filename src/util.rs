@@ -54,7 +54,6 @@ impl CircularSeqBuffer {
     }
 
     pub fn write_from_buffer_to_slice(&self, data: &mut [u8], seq: u32) {
-        // debug_assert!(seq <= self.seq);
         let offset = self.seq.wrapping_sub(seq) as i64;
         let mut start = self.end as i64 - offset;
         let mut end = start + data.len() as i64;
