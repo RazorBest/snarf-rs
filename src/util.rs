@@ -114,7 +114,7 @@ impl CircularSeqBuffer {
         }
     }
 
-    pub fn push_data_to_buffer(&mut self, data: &[u8]) {
+    pub fn push_data_overwrite(&mut self, data: &[u8]) {
         let (mut write_space, _) = self.update_and_return_split_ref(data.len());
         write_space.copy_from_slice(data);
     }
