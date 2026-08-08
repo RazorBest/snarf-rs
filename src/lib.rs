@@ -1,3 +1,7 @@
+//! Framework for building MitM applications.
+//!
+//! Skip the nasty stuff. Get visibility.
+//!
 pub mod deque;
 pub mod ipv4_util;
 pub mod tcp;
@@ -141,6 +145,12 @@ impl<NetHandler> SnarfNfqNet<NetHandler>
 where
     NetHandler: NetworkSnarfHandler<nfq::Message>,
 {
+    /// Creates a new `Self` instance from `NetHandler`.
+    ///
+    /// # Arguments
+    ///
+    /// * `opts` - Configuration options.
+    /// * `net_handler` - An instance that handles network packets.
     pub fn new_from_handler(
         opts: &SnarfNfqNetOptions,
         net_handler: NetHandler,
@@ -452,7 +462,7 @@ where
 }
 
 pub trait TransportPacketParent {
-    /// Splits into an immutable network header reference and a mutable tcp payload (including data)
+    /// Splits into an immutable network header reference and a mutable transport payload (including data)
     /// reference
     fn split(&mut self) -> (&[u8], &mut [u8]);
 }
