@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use crate::TransportPacketParent;
 use crate::deque::{DequeSlice, DequeSliceMut};
-use crate::tcp_util::{FIN_MASK, SYN_MASK, TCP_FLAGS_IDX, tcp_header_len, tcp_seq};
+use crate::tcp_util::{FIN_MASK, SYN_MASK, TCP_FLAGS_IDX, tcp_fin, tcp_header_len, tcp_seq};
 use crate::util::CircularSeqBuffer;
 
 pub const TCP_SRCPORT_OFFSET: usize = 0;
@@ -193,13 +193,6 @@ where
             return Ok((0, None, None));
         }
 
-        if (flags & FIN_MASK) != 0 {
-            self.buffer.set_seq(next_seq);
-            self.buffer.seq_add(1);
-            self.fin = true;
-            return Ok((0, None, None));
-        }
-
         let next_seq = next_seq as i64;
 
         let buffer_len = self.buffer.len() as i64;
@@ -242,6 +235,12 @@ where
             return Err(PacketTooBigError);
         }
 
+        if data_len == 0 && (flags & FIN_MASK) != 0 {
+            self.fin = true;
+            self.buffer.update(1);
+            return Ok((data_len as usize, None, None));
+        }
+
         // 1 <= X2 - E <= window_len, otherwise it's old data or outside the window
         let new_data_len = (next_seq + data_len - curr_seq) % SEQ_LIM;
         if !(1..=buffer_len).contains(&new_data_len) {
@@ -271,9 +270,22 @@ where
                 .write_from_buffer_to_slice(&mut data[..old_data_len as usize], next_seq as u32);
         }
 
-        let (write_space, remaining_space) = self
+        let mut increase_data_len = new_data_len;
+        if (flags & FIN_MASK) != 0 {
+            self.fin = true;
+            increase_data_len += 1;
+        }
+
+        let (mut write_space, remaining_space) = self
             .buffer
-            .update_and_return_split_ref(new_data_len as usize);
+            .update_and_return_split_ref(increase_data_len as usize);
+
+        if (flags & FIN_MASK) != 0 {
+            // Ignore the last byte, which belongs to FIN
+            let write_len = write_space.len();
+            let (new_write_space, _) = write_space.split_mut(write_len - 1);
+            write_space = new_write_space;
+        }
 
         Ok((
             old_data_len as usize,
@@ -317,7 +329,13 @@ where
 
             self.buffer.update(new_data_len as usize);
 
-            let verdict = (packet, new_data_len as usize);
+            let is_fin = tcp_fin(tcp_payload);
+            if is_fin {
+                self.buffer.update(1);
+                self.fin = true;
+            }
+
+            let verdict = (packet, new_data_len as usize, is_fin);
             shallow_verdicts.push(verdict);
         }
 
@@ -325,9 +343,15 @@ where
             DequeSliceMut::from_slice_mut_start_at(&mut self.buffer.buffer, start_end as usize);
         let mut verdicts = vec![];
         for shallow_verdict in shallow_verdicts {
-            let (packet, new_data_len) = shallow_verdict;
+            let (packet, new_data_len, is_fin) = shallow_verdict;
             let (write_space, new_remaining) = remaining.split_mut(new_data_len);
             remaining = new_remaining;
+
+            if is_fin {
+                let (_, new_remaining) = remaining.split_mut(1);
+                remaining = new_remaining;
+            }
+
             let verdict =
                 FutureVerdict::new(packet.rf, packet.header_len, new_data_len, write_space);
             verdicts.push(verdict);
@@ -518,6 +542,7 @@ mod helpers_test_tcp_peer_tracker {
                 return Ok(data.len() - retransmitted);
             } else if retransmitted == 0 && !data.is_empty() {
                 let mut tcp_payload = vec![0u8; DUMMY_HEADER_LEN];
+                tcp_payload[TCP_FLAGS_IDX] = flags;
                 tcp_payload.extend_from_slice(&buf);
 
                 let packet = FuturePacket::new(next_seq, DUMMY_HEADER_LEN, tcp_payload);
@@ -533,15 +558,10 @@ mod helpers_test_tcp_peer_tracker {
             (&[], self)
         }
     }
-}
 
-#[cfg(test)]
-mod test_tcp_peer_tracker {
-    use super::*;
+    pub const BUFFER_SIZE: usize = 100;
 
-    const BUFFER_SIZE: usize = 100;
-
-    fn tcp_peer_tracker() -> TcpPeerTracker<Vec<u8>> {
+    pub fn tcp_peer_tracker() -> TcpPeerTracker<Vec<u8>> {
         TcpPeerTracker {
             first_seq: false,
             fin: false,
@@ -551,7 +571,7 @@ mod test_tcp_peer_tracker {
         }
     }
 
-    fn pseudorandom_data(amount: usize) -> Vec<u8> {
+    pub fn pseudorandom_data(amount: usize) -> Vec<u8> {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -562,6 +582,14 @@ mod test_tcp_peer_tracker {
             .map(|x| ((x * x + 3 * x + 4) % (u8::MAX as usize)) as u8)
             .collect()
     }
+}
+
+#[cfg(test)]
+mod test_tcp_peer_tracker_buffer {
+    use super::*;
+    use helpers_test_tcp_peer_tracker::*;
+    // Explicit because super also has BUFFER_SIZE
+    use helpers_test_tcp_peer_tracker::BUFFER_SIZE;
 
     #[test]
     fn test_first_syn() {
@@ -1878,5 +1906,181 @@ mod test_tcp_peer_tracker {
         let data2 = pseudorandom_data(10);
         let err = t.update_and_copy_assume_new(0, 116, &data2);
         assert!(matches!(err, Err(PacketOutsideWindow)))
+    }
+}
+
+#[cfg(test)]
+mod test_tcp_peer_tracker_state {
+    use super::*;
+    use helpers_test_tcp_peer_tracker::*;
+
+    #[test]
+    fn test_empty_fin() {
+        let mut t = tcp_peer_tracker();
+        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+
+        // First segment
+        let data1 = pseudorandom_data(4);
+        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        assert_eq!(written, data1.len());
+
+        // Empty FIN
+        let written = t.update_and_copy_assume_new(FIN_MASK, 25, &[]).unwrap();
+        assert_eq!(written, 0);
+
+        assert!(t.fin);
+
+        // Final ACK
+        let written = t.update_and_copy_assume_new(0, 26, &[]).unwrap();
+        assert_eq!(written, 0);
+
+        // Test that the ringbuffer hasn't broken after the FIN packet has increased the SEQ
+        let expected = data1;
+        let mut data = vec![0; expected.len()];
+        t.buffer.write_from_buffer_to_slice(&mut data, 21);
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn test_fin_with_data() {
+        let mut t = tcp_peer_tracker();
+        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+
+        // First segment
+        let data1 = pseudorandom_data(4);
+        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        assert_eq!(written, data1.len());
+
+        // FIN with data
+        let data2 = pseudorandom_data(5);
+        let written = t.update_and_copy_assume_new(FIN_MASK, 25, &data2).unwrap();
+        assert_eq!(written, data2.len());
+        let (buf1, buf2) = t.get_last_written_from_buffer(written + 1);
+        assert_eq!(buf1[..buf1.len() - 1], data2);
+        assert_eq!(buf2, &[]);
+
+        assert!(t.fin);
+
+        // Final ACK
+        let written = t.update_and_copy_assume_new(0, 31, &[]).unwrap();
+        assert_eq!(written, 0);
+
+        // Test that the ringbuffer hasn't broken after the FIN packet has increased the SEQ
+        let expected: Vec<u8> = data1.into_iter().chain(data2).collect();
+        let mut data = vec![0; expected.len()];
+        t.buffer.write_from_buffer_to_slice(&mut data, 21);
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn test_fin_with_data_retransmitted() {
+        let mut t = tcp_peer_tracker();
+        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+
+        // First segment
+        let data1 = pseudorandom_data(4);
+        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        assert_eq!(written, data1.len());
+
+        // FIN with data
+        let data2 = pseudorandom_data(5);
+        let written = t.update_and_copy_assume_new(FIN_MASK, 25, &data2).unwrap();
+        assert_eq!(written, data2.len());
+
+        assert!(t.fin);
+
+        // FIN retransmission
+        let (retransmitted, written, buf) = t.update_and_copy(FIN_MASK, 25, &data2).unwrap();
+        assert_eq!(retransmitted, data2.len());
+        assert_eq!(written, 0);
+        assert_eq!(buf, data2);
+
+        // Final ACK
+        let written = t.update_and_copy_assume_new(0, 31, &[]).unwrap();
+        assert_eq!(written, 0);
+
+        // Test that the ringbuffer hasn't broken after the FIN packet has increased the SEQ
+        let expected: Vec<u8> = data1.into_iter().chain(data2).collect();
+        let mut data = vec![0; expected.len()];
+        t.buffer.write_from_buffer_to_slice(&mut data, 21);
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn test_fin_retranmistted_diferently() {
+        let mut t = tcp_peer_tracker();
+        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+
+        // First segment
+        let data1 = pseudorandom_data(4);
+        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        assert_eq!(written, data1.len());
+
+        // FIN with data
+        let data2 = pseudorandom_data(5);
+        let written = t.update_and_copy_assume_new(FIN_MASK, 25, &data2).unwrap();
+        assert_eq!(written, data2.len());
+
+        assert!(t.fin);
+
+        // FIN empty retransmission
+        let (retransmitted, written, buf) = t.update_and_copy(FIN_MASK, 30, &[]).unwrap();
+        assert_eq!(retransmitted, 0);
+        assert_eq!(written, 0);
+        assert_eq!(buf, &[]);
+
+        // Final ACK
+        let written = t.update_and_copy_assume_new(0, 31, &[]).unwrap();
+        assert_eq!(written, 0);
+
+        // Test that the ringbuffer hasn't broken after the FIN packet has increased the SEQ
+        let expected: Vec<u8> = data1.into_iter().chain(data2).collect();
+        let mut data = vec![0; expected.len()];
+        t.buffer.write_from_buffer_to_slice(&mut data, 21);
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn test_fin_future() {
+        let mut t = tcp_peer_tracker();
+        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+
+        // First segment
+        let data1 = pseudorandom_data(4);
+        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        assert_eq!(written, data1.len());
+
+        // FIN that is future
+        let data2 = pseudorandom_data(5);
+        let written = t.update_and_copy_assume_new(FIN_MASK, 26, &data2).unwrap();
+        assert_eq!(written, 0);
+
+        assert!(!t.fin);
+
+        // Missing byte
+        let data3 = pseudorandom_data(1);
+        let written = t.update_and_copy_assume_new(0, 25, &data3).unwrap();
+        assert_eq!(written, 1);
+
+        assert!(!t.fin);
+
+        let mut verdicts = t.update_future_queue();
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].new_data_len, data2.len());
+        verdicts[0].writable.copy_from_slice(&data2);
+
+        assert!(t.fin);
+
+        // Final ACK
+        let written = t.update_and_copy_assume_new(0, 31, &[]).unwrap();
+        assert_eq!(written, 0);
+
+        // Test that the ringbuffer hasn't broken after the FIN packet has increased the SEQ
+        dbg!(&data1);
+        dbg!(&data2);
+        let expected: Vec<u8> = data1.into_iter().chain(data3).chain(data2).collect();
+        let mut data = vec![0; expected.len()];
+        t.buffer.write_from_buffer_to_slice(&mut data, 21);
+        assert_eq!(data, expected);
     }
 }
