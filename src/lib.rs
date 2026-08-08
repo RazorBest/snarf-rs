@@ -159,7 +159,7 @@ where
         })
     }
 
-    async fn get_next_msg(&mut self) -> Result<nfq::Message, Box<dyn Error>> {
+    async fn get_next_msg(&mut self) -> Result<nfq::Message, Box<dyn Error + Send + Sync>> {
         loop {
             let mut guard = self.async_fd.readable().await?;
 
@@ -219,7 +219,10 @@ where
         Ok(())
     }
 
-    pub async fn intercept(&mut self, running: Arc<AtomicBool>) -> Result<(), Box<dyn Error>> {
+    pub async fn intercept(
+        &mut self,
+        running: Arc<AtomicBool>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         while running.load(Ordering::SeqCst) {
             let running_clone = running.clone();
             let while_running = async move {
