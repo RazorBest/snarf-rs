@@ -1,7 +1,9 @@
 use crate::ipv4_util::{
-    ipv4_checksum, ipv4_header_len, ipv4_total_len,
+    ipv4_checksum, ipv4_dst_ip, ipv4_header_len, ipv4_split, ipv4_src_ip, ipv4_total_len,
 };
 
+pub const TCP_SRCPORT_OFFSET: usize = 0;
+pub const TCP_DSTPORT_OFFSET: usize = 2;
 pub const TCP_DATAOFFSET_IDX: usize = 12;
 pub const TCP_FLAGS_IDX: usize = 13;
 pub const TCP_SEQ_OFFSET: usize = 4;
@@ -21,6 +23,33 @@ pub fn tcp_seq(tcp_payload: &[u8]) -> u32 {
         tcp_payload[TCP_SEQ_OFFSET + 2],
         tcp_payload[TCP_SEQ_OFFSET + 3],
     ])
+}
+
+#[inline(always)]
+pub fn tcp_src_port(tcp_payload: &[u8]) -> u16 {
+    u16::from_be_bytes([
+        tcp_payload[TCP_SRCPORT_OFFSET],
+        tcp_payload[TCP_SRCPORT_OFFSET + 1],
+    ])
+}
+
+#[inline(always)]
+pub fn tcp_dst_port(tcp_payload: &[u8]) -> u16 {
+    u16::from_be_bytes([
+        tcp_payload[TCP_DSTPORT_OFFSET],
+        tcp_payload[TCP_DSTPORT_OFFSET + 1],
+    ])
+}
+
+#[inline(always)]
+pub fn tcp_ipv4_session_pair(ipv4_payload: &[u8]) -> (([u8; 4], u16), ([u8; 4], u16)) {
+    let src_ip = ipv4_src_ip(ipv4_payload);
+    let dst_ip = ipv4_dst_ip(ipv4_payload);
+    let (_ip_header, tcp_payload) = ipv4_split(ipv4_payload);
+    let src_port = tcp_src_port(tcp_payload);
+    let dst_port = tcp_dst_port(tcp_payload);
+
+    ((src_ip, src_port), (dst_ip, dst_port))
 }
 
 #[inline(always)]

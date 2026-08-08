@@ -10,8 +10,6 @@ use crate::deque::{DequeSlice, DequeSliceMut};
 use crate::tcp_util::{FIN_MASK, SYN_MASK, TCP_FLAGS_IDX, tcp_fin, tcp_header_len, tcp_seq};
 use crate::util::CircularSeqBuffer;
 
-pub const TCP_SRCPORT_OFFSET: usize = 0;
-pub const TCP_DSTPORT_OFFSET: usize = 2;
 pub const SEQ_LIM: i64 = u32::MAX as i64 + 1;
 
 const BUFFER_SIZE: usize = 65535 * 16;

@@ -20,8 +20,11 @@ use etherparse::{
 use tokio::io::unix::AsyncFd;
 
 use crate::ipv4_util::ipv4_checksum;
-use crate::tcp::{TCP_DSTPORT_OFFSET, TCP_SRCPORT_OFFSET, TcpSession};
-use crate::tcp_util::{TCP_DATAOFFSET_IDX, TCP_SEQ_OFFSET};
+use crate::tcp::TcpSession;
+use crate::tcp_util::{
+    TCP_DATAOFFSET_IDX, TCP_DSTPORT_OFFSET, TCP_SEQ_OFFSET,
+    TCP_SRCPORT_OFFSET, tcp_header_len,
+};
 
 pub enum SnarfInterceptVerdict<RF> {
     Accept(RF),
