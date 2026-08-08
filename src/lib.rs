@@ -537,7 +537,7 @@ where
             tcp_payload[TCP_DSTPORT_OFFSET],
             tcp_payload[TCP_DSTPORT_OFFSET + 1],
         ]);
-        let header_len = (tcp_payload[TCP_DATAOFFSET_IDX] >> 4) as usize * 4;
+        let header_len = tcp_header_len(tcp_payload);
 
         if self.sessions.map.len() > 1000 {
             panic!("Too many sessions");
