@@ -590,6 +590,8 @@ where
             InterceptVerdict::Accept
         };
 
+        let mut verdicts = self.transport_packet_verdict_kept();
+
         self.transport_spy.after(
             net_header,
             tcp_header,
@@ -599,14 +601,12 @@ where
             &InterceptVerdict::Accept,
         );
 
-        let mut verdicts = self.transport_packet_verdict_kept();
-
         match this_verdict {
             InterceptVerdict::Accept => {
-                verdicts.insert(0, SnarfInterceptVerdict::Accept(rf));
+                verdicts.push(SnarfInterceptVerdict::Accept(rf));
             }
             InterceptVerdict::Drop => {
-                verdicts.insert(0, SnarfInterceptVerdict::Drop(rf));
+                verdicts.push(SnarfInterceptVerdict::Drop(rf));
             }
         }
 
