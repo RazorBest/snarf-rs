@@ -1,4 +1,6 @@
 use crate::deque::DequeSliceMut;
+use crate::ipv4_util::ipv4_header_len;
+use crate::tcp_util::update_checksum_tcp_ipv4;
 
 pub const SEQ_LIM: i64 = u32::MAX as i64 + 1;
 
@@ -18,10 +20,6 @@ impl CircularSeqBuffer {
         }
     }
 
-    pub fn set_seq(&mut self, seq: u32) {
-        self.seq = seq;
-    }
-
     pub fn seq_add(&mut self, increment: u32) {
         self.seq = self.seq.wrapping_add(increment);
     }
@@ -38,7 +36,7 @@ impl CircularSeqBuffer {
         (1..=self.len() as i64).contains(&diff)
     }
 
-    pub fn get_new(&mut self, next_seq: u32, data_len: usize) -> i64 {
+    pub fn get_new(&self, next_seq: u32, data_len: usize) -> i64 {
         let mut new_data_len = (next_seq as i64 + data_len as i64 - (self.seq as i64)) % SEQ_LIM;
         if (new_data_len + self.len() as i64) % SEQ_LIM < self.len() as i64 {
             new_data_len = 0;
@@ -55,8 +53,8 @@ impl CircularSeqBuffer {
         self.buffer.is_empty()
     }
 
+    /// Copies the data starting the given seq number into the given slice.
     pub fn write_from_buffer_to_slice(&self, data: &mut [u8], seq: u32) {
-        // debug_assert!(seq <= self.seq);
         let offset = self.seq.wrapping_sub(seq) as i64;
         let mut start = self.end as i64 - offset;
         let mut end = start + data.len() as i64;
@@ -79,34 +77,34 @@ impl CircularSeqBuffer {
         }
     }
 
+    /// Extends the ring buffer by count elements, without writing.
+    ///
+    /// # Arguments
+    ///
+    /// * `count` - The amount of elements to extend by.
+    ///
+    /// # Returns
+    ///
+    /// A ring view of the unwritten data, and a ring view of the rest of the ring buffer.
     pub fn update_and_return_split_ref<'a>(
         &'a mut self,
-        data_len: usize,
+        count: usize,
     ) -> (DequeSliceMut<'a, u8>, DequeSliceMut<'a, u8>) {
-        /*
-         * Assumptions: seq == self.end_seq
-         * data_len <= self.buffer.len(
-         * */
-        let buffer_len = self.len() as u32;
         let old_end = self.end as usize;
 
-        self.seq = self.seq.wrapping_add(data_len as u32);
+        self.seq = self.seq.wrapping_add(count as u32);
 
-        self.end += data_len as u32;
-        if self.end >= buffer_len {
-            self.end -= buffer_len;
+        self.end += count as u32;
+        if self.end >= self.len() as u32 {
+            self.end -= self.len() as u32;
         }
 
         let buffer = DequeSliceMut::from_slice_mut_start_at(&mut self.buffer, old_end);
 
-        buffer.split_mut(data_len)
+        buffer.split_mut(count)
     }
 
     pub fn update(&mut self, data_len: usize) {
-        /*
-         * Assumptions: seq == self.end_seq
-         * data.len() <= self.buffer.len(
-         * */
         let buffer_len = self.buffer.len() as u32;
 
         // TCP data [] --> buffer
@@ -118,8 +116,14 @@ impl CircularSeqBuffer {
         }
     }
 
-    pub fn push_data_to_buffer(&mut self, data: &[u8]) {
+    pub fn push_data_overwrite(&mut self, data: &[u8]) {
         let (mut write_space, _) = self.update_and_return_split_ref(data.len());
         write_space.copy_from_slice(data);
     }
+}
+
+pub fn update_checksum_ipv4_tcp_packet(ip_packet: &mut [u8]) {
+    let ip_len = ipv4_header_len(ip_packet) as usize;
+    let (ip_header, tcp_payload) = ip_packet.split_at_mut(ip_len);
+    update_checksum_tcp_ipv4(ip_header, tcp_payload);
 }

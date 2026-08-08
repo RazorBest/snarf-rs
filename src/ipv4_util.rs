@@ -16,6 +16,18 @@ pub fn ipv4_total_len(payload: &[u8]) -> u16 {
     ])
 }
 
+pub fn ipv4_src_ip(payload: &[u8]) -> [u8; 4] {
+    payload[SRC_IPV4_OFFSET..SRC_IPV4_OFFSET + 4]
+        .try_into()
+        .unwrap()
+}
+
+pub fn ipv4_dst_ip(payload: &[u8]) -> [u8; 4] {
+    payload[DST_IPV4_OFFSET..DST_IPV4_OFFSET + 4]
+        .try_into()
+        .unwrap()
+}
+
 #[inline(always)]
 pub fn ipv4_split(payload: &[u8]) -> (&[u8], &[u8]) {
     let header_len = ipv4_header_len(payload) as usize;
@@ -62,7 +74,7 @@ pub fn ipv4_word_sum(ip: [u8; 4]) -> u32 {
 /// `skipword` will be skipped. Each word is treated as big endian.
 #[inline(always)]
 pub fn sum_be_words(data: &[u8], skipword: usize) -> u32 {
-    if !data.is_empty() {
+    if data.is_empty() {
         return 0;
     }
     let len = data.len();
@@ -93,4 +105,35 @@ pub fn finalize_checksum(mut sum: u32) -> u16 {
         sum = (sum >> 16) + (sum & 0xFFFF);
     }
     !sum as u16
+}
+
+#[cfg(test)]
+mod test_ipv4_util {
+    use super::*;
+
+    macro_rules! from_hex {
+        ($hex:expr) => {{
+            let s = $hex;
+            assert!(s.len() % 2 == 0);
+            s.as_bytes()
+                .chunks_exact(2)
+                .map(|c| {
+                    let s = std::str::from_utf8(c).unwrap();
+                    u8::from_str_radix(s, 16).unwrap()
+                })
+                .collect::<Vec<u8>>()
+        }};
+    }
+
+    #[test]
+    fn test_ipv4_checksum() {
+        let src_ip: [u8; 4] = from_hex!("63a39bcd").try_into().unwrap();
+        let dst_ip: [u8; 4] = from_hex!("8840e5ea").try_into().unwrap();
+        let data = from_hex!(
+            "d36420fc958a199a00000000a002ffd7000000000204ffd70402080ac8fd22cd0000000001030307"
+        );
+
+        let checksum = ipv4_checksum(&data, src_ip, dst_ip);
+        assert_eq!(checksum, 0x5118);
+    }
 }

@@ -1,3 +1,7 @@
+//! Framework for building MitM applications.
+//!
+//! Skip the nasty stuff. Get visibility.
+//!
 pub mod deque;
 pub mod ipv4_util;
 pub mod tcp;
@@ -7,21 +11,21 @@ pub mod util;
 use std::collections::HashMap;
 use std::error::Error;
 use std::hash::Hash;
-use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use bytes::BytesMut;
 use etherparse::{
     InternetSlice::{Ipv4, Ipv6},
     SlicedPacket,
 };
 use tokio::io::unix::AsyncFd;
 
-use crate::ipv4_util::ipv4_checksum;
-use crate::tcp::{TCP_DSTPORT_OFFSET, TCP_SRCPORT_OFFSET, TcpSession};
-use crate::tcp_util::{TCP_DATAOFFSET_IDX, TCP_SEQ_OFFSET};
+use crate::tcp::TcpSession;
+use crate::tcp_util::{
+    TCP_DSTPORT_OFFSET, TCP_SEQ_OFFSET, TCP_SRCPORT_OFFSET, tcp_header_len,
+    update_checksum_tcp_ipv4,
+};
 
 pub enum SnarfInterceptVerdict<RF> {
     Accept(RF),
@@ -32,7 +36,6 @@ pub enum SnarfInterceptVerdict<RF> {
 pub enum InterceptVerdict {
     Accept,
     Drop,
-    Keep,
 }
 
 pub trait NetworkSnarfHandler<RF> {
@@ -142,6 +145,12 @@ impl<NetHandler> SnarfNfqNet<NetHandler>
 where
     NetHandler: NetworkSnarfHandler<nfq::Message>,
 {
+    /// Creates a new `Self` instance from `NetHandler`.
+    ///
+    /// # Arguments
+    ///
+    /// * `opts` - Configuration options.
+    /// * `net_handler` - An instance that handles network packets.
     pub fn new_from_handler(
         opts: &SnarfNfqNetOptions,
         net_handler: NetHandler,
@@ -149,6 +158,7 @@ where
         let mut queue = nfq::Queue::open()?;
         queue.bind(opts.queue_num)?;
         queue.set_nonblocking(true);
+        queue.set_copy_range(opts.queue_num, u16::MAX)?;
 
         let async_fd = AsyncFd::new(queue.as_raw_fd())?;
 
@@ -159,7 +169,7 @@ where
         })
     }
 
-    async fn get_next_msg(&mut self) -> Result<nfq::Message, Box<dyn Error>> {
+    async fn get_next_msg(&mut self) -> Result<nfq::Message, Box<dyn Error + Send + Sync>> {
         loop {
             let mut guard = self.async_fd.readable().await?;
 
@@ -219,7 +229,10 @@ where
         Ok(())
     }
 
-    pub async fn intercept(&mut self, running: Arc<AtomicBool>) -> Result<(), Box<dyn Error>> {
+    pub async fn intercept(
+        &mut self,
+        running: Arc<AtomicBool>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         while running.load(Ordering::SeqCst) {
             let running_clone = running.clone();
             let while_running = async move {
@@ -227,7 +240,7 @@ where
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 }
             };
-            let mut msg = tokio::select! {
+            let msg = tokio::select! {
                 msg = self.get_next_msg() => {
                     msg
                 },
@@ -245,10 +258,6 @@ where
                     panic!("Packet was truncated");
                 }
             }
-
-            // let net_payload = msg.get_payload_mut();
-            let mut payload = BytesMut::new();
-            mem::swap(&mut msg.payload, &mut payload);
 
             let verdicts = self.net_handler.on_payload(msg);
 
@@ -349,22 +358,16 @@ where
             let up_verdict = match verdict {
                 SnarfInterceptVerdict::Accept(mut rf) => {
                     let (ip_header, tcp_payload) = rf.split();
-                    let new_checksum = ipv4_checksum(
-                        tcp_payload,
-                        ip_header[12..16].try_into().unwrap(),
-                        ip_header[16..20].try_into().unwrap(),
-                    );
-                    tcp_payload[16..18].copy_from_slice(&new_checksum.to_be_bytes());
-
+                    update_checksum_tcp_ipv4(ip_header, tcp_payload);
                     self.net_spy
                         .after(ip_header, tcp_payload, &InterceptVerdict::Accept);
 
                     SnarfInterceptVerdict::Accept(rf.message)
                 }
                 SnarfInterceptVerdict::Drop(mut rf) => {
-                    let (net_header, tcp_payload) = rf.split();
+                    let (ip_header, tcp_payload) = rf.split();
                     self.net_spy
-                        .after(net_header, tcp_payload, &InterceptVerdict::Drop);
+                        .after(ip_header, tcp_payload, &InterceptVerdict::Drop);
 
                     SnarfInterceptVerdict::Drop(rf.message)
                 }
@@ -459,11 +462,12 @@ where
 }
 
 pub trait TransportPacketParent {
-    /// Splits into an immutable network header reference and a mutable tcp payload (including data)
+    /// Splits into an immutable network header reference and a mutable transport payload (including data)
     /// reference
     fn split(&mut self) -> (&[u8], &mut [u8]);
 }
 
+#[derive(Debug)]
 pub struct NfqMessageParent {
     pub message: nfq::Message,
     pub ip_header_len: usize,
@@ -543,11 +547,7 @@ where
             tcp_payload[TCP_DSTPORT_OFFSET],
             tcp_payload[TCP_DSTPORT_OFFSET + 1],
         ]);
-        let header_len = (tcp_payload[TCP_DATAOFFSET_IDX] >> 4) as usize * 4;
-
-        if self.sessions.map.len() > 1000 {
-            panic!("Too many sessions");
-        }
+        let header_len = tcp_header_len(tcp_payload);
 
         let src_addr = TcpAddr::new(src_net, src_port);
         let dst_addr = TcpAddr::new(dst_net, dst_port);
@@ -574,7 +574,7 @@ where
             return vec![SnarfInterceptVerdict::Keep];
         }
 
-        if let Some(mut writable) = writable {
+        let this_verdict = if let Some(mut writable) = writable {
             let mut seq = u32::from_be_bytes([
                 tcp_header[TCP_SEQ_OFFSET],
                 tcp_header[TCP_SEQ_OFFSET + 1],
@@ -585,10 +585,17 @@ where
 
             let new_data = &mut data[retransmitted..];
 
-            self.app_data_handler
+            let this_verdict = self
+                .app_data_handler
                 .on_data(session_id, is_client, seq as i64, new_data);
             writable.copy_from_slice(new_data);
-        }
+
+            this_verdict
+        } else {
+            InterceptVerdict::Accept
+        };
+
+        let mut verdicts = self.transport_packet_verdict_kept();
 
         self.transport_spy.after(
             net_header,
@@ -599,9 +606,14 @@ where
             &InterceptVerdict::Accept,
         );
 
-        let mut verdicts = self.transport_packet_verdict_kept();
-
-        verdicts.insert(0, SnarfInterceptVerdict::Accept(rf));
+        match this_verdict {
+            InterceptVerdict::Accept => {
+                verdicts.push(SnarfInterceptVerdict::Accept(rf));
+            }
+            InterceptVerdict::Drop => {
+                verdicts.push(SnarfInterceptVerdict::Drop(rf));
+            }
+        }
 
         verdicts
     }
