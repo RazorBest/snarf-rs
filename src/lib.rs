@@ -539,10 +539,6 @@ where
         ]);
         let header_len = tcp_header_len(tcp_payload);
 
-        if self.sessions.map.len() > 1000 {
-            panic!("Too many sessions");
-        }
-
         let src_addr = TcpAddr::new(src_net, src_port);
         let dst_addr = TcpAddr::new(dst_net, dst_port);
         self.last_used_key = Some((src_addr, dst_addr));
