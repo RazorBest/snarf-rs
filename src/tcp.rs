@@ -99,28 +99,6 @@ where
     }
 }
 
-pub struct RemainingSpace<'a> {
-    pub half1: &'a [u8],
-    pub half2: &'a [u8],
-}
-
-impl<'a> RemainingSpace<'a> {
-    pub fn new(half1: &'a [u8], half2: &'a [u8]) -> Self {
-        Self { half1, half2 }
-    }
-}
-
-pub struct WriteSpace<'a> {
-    pub half1: &'a mut [u8],
-    pub half2: &'a mut [u8],
-}
-
-impl<'a> WriteSpace<'a> {
-    pub fn new(half1: &'a mut [u8], half2: &'a mut [u8]) -> Self {
-        Self { half1, half2 }
-    }
-}
-
 impl<Idx> Index<Idx> for CircularSeqBuffer
 where
     Idx: SliceIndex<[u8]>,
