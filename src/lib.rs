@@ -227,7 +227,7 @@ where
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 }
             };
-            let mut msg = tokio::select! {
+            let msg = tokio::select! {
                 msg = self.get_next_msg() => {
                     msg
                 },
@@ -245,10 +245,6 @@ where
                     panic!("Packet was truncated");
                 }
             }
-
-            // let net_payload = msg.get_payload_mut();
-            let mut payload = BytesMut::new();
-            mem::swap(&mut msg.payload, &mut payload);
 
             let verdicts = self.net_handler.on_payload(msg);
 
