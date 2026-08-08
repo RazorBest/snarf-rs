@@ -32,7 +32,6 @@ pub enum SnarfInterceptVerdict<RF> {
 pub enum InterceptVerdict {
     Accept,
     Drop,
-    Keep,
 }
 
 pub trait NetworkSnarfHandler<RF> {
@@ -570,7 +569,7 @@ where
             return vec![SnarfInterceptVerdict::Keep];
         }
 
-        if let Some(mut writable) = writable {
+        let this_verdict = if let Some(mut writable) = writable {
             let mut seq = u32::from_be_bytes([
                 tcp_header[TCP_SEQ_OFFSET],
                 tcp_header[TCP_SEQ_OFFSET + 1],
@@ -581,10 +580,15 @@ where
 
             let new_data = &mut data[retransmitted..];
 
-            self.app_data_handler
+            let this_verdict = self
+                .app_data_handler
                 .on_data(session_id, is_client, seq as i64, new_data);
             writable.copy_from_slice(new_data);
-        }
+
+            this_verdict
+        } else {
+            InterceptVerdict::Accept
+        };
 
         self.transport_spy.after(
             net_header,
@@ -597,7 +601,14 @@ where
 
         let mut verdicts = self.transport_packet_verdict_kept();
 
-        verdicts.insert(0, SnarfInterceptVerdict::Accept(rf));
+        match this_verdict {
+            InterceptVerdict::Accept => {
+                verdicts.insert(0, SnarfInterceptVerdict::Accept(rf));
+            }
+            InterceptVerdict::Drop => {
+                verdicts.insert(0, SnarfInterceptVerdict::Drop(rf));
+            }
+        }
 
         verdicts
     }
