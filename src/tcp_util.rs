@@ -62,6 +62,13 @@ pub fn tcp_ipv4_data_len(ipv4_payload: &[u8]) -> usize {
 }
 
 #[inline(always)]
+pub fn tcp_ipv4_syn(ipv4_payload: &[u8]) -> bool {
+    let iphlen = ipv4_header_len(ipv4_payload) as usize;
+
+    tcp_syn(&ipv4_payload[iphlen..])
+}
+
+#[inline(always)]
 pub fn tcp_ipv4_seq(ipv4_payload: &[u8]) -> u32 {
     let iphlen = ipv4_header_len(ipv4_payload) as usize;
 
