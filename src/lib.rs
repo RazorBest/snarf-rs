@@ -7,23 +7,20 @@ pub mod util;
 use std::collections::HashMap;
 use std::error::Error;
 use std::hash::Hash;
-use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use bytes::BytesMut;
 use etherparse::{
     InternetSlice::{Ipv4, Ipv6},
     SlicedPacket,
 };
 use tokio::io::unix::AsyncFd;
 
-use crate::ipv4_util::ipv4_checksum;
 use crate::tcp::TcpSession;
 use crate::tcp_util::{
-    TCP_DATAOFFSET_IDX, TCP_DSTPORT_OFFSET, TCP_SEQ_OFFSET,
-    TCP_SRCPORT_OFFSET, tcp_header_len,
+    TCP_DSTPORT_OFFSET, TCP_SEQ_OFFSET, TCP_SRCPORT_OFFSET, tcp_header_len,
+    update_checksum_tcp_ipv4,
 };
 
 pub enum SnarfInterceptVerdict<RF> {
@@ -351,13 +348,7 @@ where
             let up_verdict = match verdict {
                 SnarfInterceptVerdict::Accept(mut rf) => {
                     let (ip_header, tcp_payload) = rf.split();
-                    let new_checksum = ipv4_checksum(
-                        tcp_payload,
-                        ip_header[12..16].try_into().unwrap(),
-                        ip_header[16..20].try_into().unwrap(),
-                    );
-                    tcp_payload[16..18].copy_from_slice(&new_checksum.to_be_bytes());
-
+                    update_checksum_tcp_ipv4(ip_header, tcp_payload);
                     self.net_spy
                         .after(ip_header, tcp_payload, &InterceptVerdict::Accept);
 
