@@ -355,9 +355,9 @@ where
                     SnarfInterceptVerdict::Accept(rf.message)
                 }
                 SnarfInterceptVerdict::Drop(mut rf) => {
-                    let (net_header, tcp_payload) = rf.split();
+                    let (ip_header, tcp_payload) = rf.split();
                     self.net_spy
-                        .after(net_header, tcp_payload, &InterceptVerdict::Drop);
+                        .after(ip_header, tcp_payload, &InterceptVerdict::Drop);
 
                     SnarfInterceptVerdict::Drop(rf.message)
                 }
