@@ -457,6 +457,7 @@ pub trait TransportPacketParent {
     fn split(&mut self) -> (&[u8], &mut [u8]);
 }
 
+#[derive(Debug)]
 pub struct NfqMessageParent {
     pub message: nfq::Message,
     pub ip_header_len: usize,
