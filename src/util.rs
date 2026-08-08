@@ -53,6 +53,7 @@ impl CircularSeqBuffer {
         self.buffer.is_empty()
     }
 
+    /// Copies the data starting the given seq number into the given slice.
     pub fn write_from_buffer_to_slice(&self, data: &mut [u8], seq: u32) {
         let offset = self.seq.wrapping_sub(seq) as i64;
         let mut start = self.end as i64 - offset;
@@ -76,14 +77,19 @@ impl CircularSeqBuffer {
         }
     }
 
+    /// Extends the ring buffer by count elements, without writing.
+    ///
+    /// # Arguments
+    ///
+    /// * `count` - The amount of elements to extend by.
+    ///
+    /// # Returns
+    ///
+    /// A ring view of the unwritten data, and a ring view of the rest of the ring buffer.
     pub fn update_and_return_split_ref<'a>(
         &'a mut self,
         count: usize,
     ) -> (DequeSliceMut<'a, u8>, DequeSliceMut<'a, u8>) {
-        /*
-         * Assumptions: seq == self.end_seq
-         * data_len <= self.buffer.len(
-         * */
         let old_end = self.end as usize;
 
         self.seq = self.seq.wrapping_add(count as u32);
@@ -99,10 +105,6 @@ impl CircularSeqBuffer {
     }
 
     pub fn update(&mut self, data_len: usize) {
-        /*
-         * Assumptions: seq == self.end_seq
-         * data.len() <= self.buffer.len(
-         * */
         let buffer_len = self.buffer.len() as u32;
 
         // TCP data [] --> buffer
