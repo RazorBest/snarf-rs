@@ -1,4 +1,4 @@
-use std::cmp::{Ordering, max};
+use std::cmp::Ordering;
 use std::hash::Hash;
 use std::mem;
 use std::ops::{Index, IndexMut};
@@ -354,7 +354,10 @@ where
         self.add_future_packet(packet);
     }
 
+    // If you remove the test marker, find a way to explain the FIN behaviour to the user
+    #[cfg(test)]
     pub fn get_last_written_from_buffer(&self, written: usize) -> (&[u8], &[u8]) {
+        use std::cmp::max;
         let (half1, half2) = self.buffer.buffer.split_at(self.buffer.end as usize);
         let start1 = max(half1.len(), written) - written;
         if half1.len() >= written {
