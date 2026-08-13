@@ -383,6 +383,21 @@ where
         Ok(())
     }
 
+    pub fn drain_nowrite_future_queue(&mut self) -> Vec<FutureVerdict<'static, RF>> {
+        self.future_size = 0;
+        let mut verdicts = vec![];
+        for packet in self.future.drain(..) {
+            verdicts.push(FutureVerdict::new(
+                packet.rf,
+                packet.header_len,
+                0,
+                DequeSliceMut::mt(),
+            ));
+        }
+
+        verdicts
+    }
+
     // If you remove the test marker, find a way to explain the FIN behaviour to the user
     #[cfg(test)]
     pub fn get_last_written_from_buffer(&self, written: usize) -> (&[u8], &[u8]) {
@@ -506,6 +521,17 @@ where
             self.src_tracker.update_future_queue()
         } else {
             self.dst_tracker.update_future_queue()
+        }
+    }
+
+    pub fn drain_nowrite_future_queue(
+        &mut self,
+        is_client: bool,
+    ) -> Vec<FutureVerdict<'static, RF>> {
+        if is_client {
+            self.src_tracker.drain_nowrite_future_queue()
+        } else {
+            self.dst_tracker.drain_nowrite_future_queue()
         }
     }
 }
