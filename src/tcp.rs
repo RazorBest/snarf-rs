@@ -13,11 +13,13 @@ use crate::util::CircularSeqBuffer;
 pub const SEQ_LIM: i64 = u32::MAX as i64 + 1;
 
 const BUFFER_SIZE: usize = 65535 * 16;
+const MAX_FUTURE_SIZE: usize = 65535 * 16;
 
 #[derive(Debug, Clone)]
 pub enum SnarfTcpError {
     PacketTooBigError,
     PacketOutsideWindow,
+    FutureQueueOverflow,
 }
 use SnarfTcpError::*;
 
@@ -137,6 +139,7 @@ where
 
     pub buffer: CircularSeqBuffer,
     pub future: Vec<FuturePacket<RF>>,
+    pub future_size: usize,
 }
 
 impl<RF> TcpPeerTracker<RF>
@@ -150,6 +153,7 @@ where
 
             buffer: CircularSeqBuffer::new(BUFFER_SIZE),
             future: vec![],
+            future_size: 0,
         }
     }
 
@@ -289,6 +293,7 @@ where
         let mut shallow_verdicts = vec![];
         let mut old_future = vec![];
         mem::swap(&mut self.future, &mut old_future);
+        self.future_size = 0;
         // Futures are sorted
         for mut packet in old_future {
             let &mut FuturePacket {
@@ -304,6 +309,7 @@ where
 
             // Still a future packet
             if !(0..=data_len).contains(&old_data_len) {
+                self.future_size += tcp_payload.len();
                 self.add_future_packet(packet);
                 continue;
             }
@@ -349,22 +355,32 @@ where
         verdicts
     }
 
-    pub fn add_future_packet(&mut self, packet: FuturePacket<RF>) {
+    /// Adds a future packet to the sorted queue.
+    ///
+    /// The caller must update self.future_size
+    fn add_future_packet(&mut self, packet: FuturePacket<RF>) {
         self.future.push(packet);
         self.future.sort();
     }
 
-    pub fn add_future_payload(&mut self, mut rf: RF)
+    pub fn add_future_payload(&mut self, mut rf: RF) -> std::result::Result<(), (RF, SnarfTcpError)>
     where
         RF: TransportPacketParent,
     {
         let (_, tcp_payload) = rf.split();
+
+        if tcp_payload.len() + self.future_size > MAX_FUTURE_SIZE {
+            return Err((rf, FutureQueueOverflow));
+        }
+
         let seq = tcp_seq(tcp_payload);
         let header_len = tcp_header_len(tcp_payload);
 
+        self.future_size += tcp_payload.len();
         let packet = FuturePacket::new(seq, header_len, rf);
-
         self.add_future_packet(packet);
+
+        Ok(())
     }
 
     // If you remove the test marker, find a way to explain the FIN behaviour to the user
@@ -473,11 +489,15 @@ where
         }
     }
 
-    pub fn add_future_payload(&mut self, is_client: bool, parent_reference: RF) {
+    pub fn add_future_payload(
+        &mut self,
+        is_client: bool,
+        parent_reference: RF,
+    ) -> std::result::Result<(), (RF, SnarfTcpError)> {
         if is_client {
-            self.src_tracker.add_future_payload(parent_reference);
+            self.src_tracker.add_future_payload(parent_reference)
         } else {
-            self.dst_tracker.add_future_payload(parent_reference);
+            self.dst_tracker.add_future_payload(parent_reference)
         }
     }
 
@@ -560,6 +580,7 @@ mod helpers_test_tcp_peer_tracker {
 
             buffer: CircularSeqBuffer::new(BUFFER_SIZE),
             future: vec![],
+            future_size: 0,
         }
     }
 
