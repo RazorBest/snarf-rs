@@ -603,7 +603,7 @@ where
             is_client,
             data,
             session_id,
-            &InterceptVerdict::Accept,
+            &this_verdict,
         );
 
         match this_verdict {
