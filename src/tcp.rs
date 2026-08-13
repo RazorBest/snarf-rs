@@ -173,17 +173,6 @@ where
         next_seq: u32,
         data: &mut [u8],
     ) -> Result<TcpTrackerUpdateResult<'a>> {
-        if (flags & SYN_MASK) != 0 && !self.first_seq {
-            self.buffer.seq = next_seq;
-            self.buffer.seq_add(1);
-            self.first_seq = true;
-
-            return Ok((0, None, None));
-        }
-
-        let next_seq = next_seq as i64;
-
-        let buffer_len = self.buffer.len() as i64;
         /*
          * S = seq of the first byte still available in the window
          * E = self.buffer.seq = seq of the first byte outside the window
@@ -214,7 +203,7 @@ where
             .....S......................EX1....X2
             .....S......................E..X1..X2
         */
-
+        let buffer_len = self.buffer.len() as i64;
         let data_len = data.len() as i64;
         let curr_seq = self.buffer.seq as i64;
 
@@ -222,6 +211,20 @@ where
         if data_len > buffer_len {
             return Err(PacketTooBigError);
         }
+
+        if (flags & SYN_MASK) != 0 && !self.first_seq {
+            self.buffer.seq = next_seq;
+            self.buffer.seq_add(1);
+            self.first_seq = true;
+
+            return Ok((0, None, None));
+        } else if !self.first_seq {
+            // This is a rare case. The connection has not encountered SYN yet
+            //  so we consider all packets to be future
+            return Ok((0, None, None));
+        }
+
+        let next_seq = next_seq as i64;
 
         if data_len == 0 && (flags & FIN_MASK) != 0 {
             self.fin = true;
