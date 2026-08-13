@@ -21,7 +21,7 @@ use etherparse::{
 };
 use tokio::io::unix::AsyncFd;
 
-use crate::tcp::TcpSession;
+use crate::tcp::{SnarfTcpError, TcpSession};
 use crate::tcp_util::{
     TCP_DSTPORT_OFFSET, TCP_SEQ_OFFSET, TCP_SRCPORT_OFFSET, tcp_header_len,
     update_checksum_tcp_ipv4,
@@ -459,6 +459,21 @@ where
             TcpSessionWithId::new(session_id)
         })
     }
+
+    pub fn remove_session(
+        &mut self,
+        src_addr: TcpAddr<NetAddr>,
+        dst_addr: TcpAddr<NetAddr>,
+    ) -> Option<TcpSessionWithId<NetAddr, RF>> {
+        // Sort them
+        let key = if src_addr < dst_addr {
+            (src_addr, dst_addr)
+        } else {
+            (dst_addr, src_addr)
+        };
+
+        self.map.remove(&key)
+    }
 }
 
 pub trait TransportPacketParent {
@@ -564,17 +579,29 @@ where
         let (is_client, retransmitted, writable, _) = session
             .read_tcp_packet(src_net, src_port, tcp_payload)
             .unwrap();
+
         self.last_is_client = is_client;
 
         let (tcp_header, data) = tcp_payload[..].split_at_mut(header_len);
 
+        let mut remove_session = false;
         // If packet is from future
-        if writable.is_none() && retransmitted == 0 && !data.is_empty() {
-            session.add_future_payload(is_client, rf);
-            return vec![SnarfInterceptVerdict::Keep];
-        }
-
-        let this_verdict = if let Some(mut writable) = writable {
+        let (mut rf, this_verdict) = if writable.is_none() && retransmitted == 0 && !data.is_empty()
+        {
+            let res = session.add_future_payload(is_client, rf);
+            match res {
+                Err((rf, SnarfTcpError::FutureQueueOverflow)) => {
+                    remove_session = true;
+                    (rf, InterceptVerdict::Drop)
+                }
+                Err((_rf, err)) => {
+                    panic!("{:?}", err);
+                }
+                _ => {
+                    return vec![SnarfInterceptVerdict::Keep];
+                }
+            }
+        } else if let Some(mut writable) = writable {
             let mut seq = u32::from_be_bytes([
                 tcp_header[TCP_SEQ_OFFSET],
                 tcp_header[TCP_SEQ_OFFSET + 1],
@@ -590,12 +617,23 @@ where
                 .on_data(session_id, is_client, seq as i64, new_data);
             writable.copy_from_slice(new_data);
 
-            this_verdict
+            (rf, this_verdict)
         } else {
-            InterceptVerdict::Accept
+            (rf, InterceptVerdict::Accept)
         };
 
-        let mut verdicts = self.transport_packet_verdict_kept();
+        let mut verdicts = if remove_session {
+            let verdicts = self.drain_futures_from_last_session();
+            self.sessions.remove_session(src_addr, dst_addr);
+
+            verdicts
+        } else {
+            self.transport_packet_verdict_kept()
+        };
+
+        let (net_header, tcp_payload) = rf.split();
+        let header_len = tcp_header_len(tcp_payload);
+        let (tcp_header, data) = tcp_payload[..].split_at(header_len);
 
         self.transport_spy.after(
             net_header,
@@ -668,6 +706,60 @@ where
             );
 
             upstream_verdicts.push(SnarfInterceptVerdict::Accept(parent));
+        }
+
+        upstream_verdicts
+    }
+
+    fn drain_futures_from_last_session(&mut self) -> Vec<SnarfInterceptVerdict<RF>> {
+        let Some(&mut TcpSessionWithId {
+            ref mut session,
+            session_id,
+        }) = Self::get_last_accessed_session(self.last_used_key, &mut self.sessions)
+        else {
+            return vec![];
+        };
+
+        let mut upstream_verdicts = vec![];
+
+        let is_client = true;
+        let future_verdicts = session.drain_nowrite_future_queue(is_client);
+        for vd in future_verdicts {
+            let mut parent = vd.rf;
+            let (net_header, tcp_payload) = parent.split();
+            let header_len = vd.header_len;
+            let (tcp_header, data) = tcp_payload.split_at_mut(header_len);
+
+            self.transport_spy.after(
+                net_header,
+                tcp_header,
+                true,
+                data,
+                session_id,
+                &InterceptVerdict::Drop,
+            );
+
+            upstream_verdicts.push(SnarfInterceptVerdict::Drop(parent));
+        }
+
+        let is_client = false;
+        let future_verdicts = session.drain_nowrite_future_queue(is_client);
+        for vd in future_verdicts {
+            let mut parent = vd.rf;
+            let (net_header, tcp_payload) = parent.split();
+            let header_len = vd.header_len;
+            let (tcp_header, data) = tcp_payload.split_at_mut(header_len);
+
+            self.transport_spy.after(
+                net_header,
+                tcp_header,
+                is_client,
+                data,
+                session_id,
+                &InterceptVerdict::Drop,
+            );
+
+            upstream_verdicts.push(SnarfInterceptVerdict::Drop(parent));
         }
 
         upstream_verdicts
