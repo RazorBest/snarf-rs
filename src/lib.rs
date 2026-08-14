@@ -576,7 +576,7 @@ where
         self.transport_spy
             .before(net_header, tcp_header, data, session_id);
 
-        let (is_client, retransmitted, writable, _) = session
+        let (is_client, retransmitted, writable, _, closing) = session
             .read_tcp_packet(src_net, src_port, tcp_payload)
             .unwrap();
 
@@ -584,43 +584,43 @@ where
 
         let (tcp_header, data) = tcp_payload[..].split_at_mut(header_len);
 
-        let mut remove_session = false;
+        let mut remove_session = closing;
         // If packet is from future
-        let (mut rf, this_verdict) = if writable.is_none() && retransmitted == 0 && !data.is_empty()
-        {
-            let res = session.add_future_payload(is_client, rf);
-            match res {
-                Err((rf, SnarfTcpError::FutureQueueOverflow)) => {
-                    remove_session = true;
-                    (rf, InterceptVerdict::Drop)
+        let (mut rf, this_verdict) =
+            if writable.is_none() && retransmitted == 0 && !data.is_empty() && !closing {
+                let res = session.add_future_payload(is_client, rf);
+                match res {
+                    Err((rf, SnarfTcpError::FutureQueueOverflow)) => {
+                        remove_session = true;
+                        (rf, InterceptVerdict::Drop)
+                    }
+                    Err((_rf, err)) => {
+                        panic!("{:?}", err);
+                    }
+                    _ => {
+                        return vec![SnarfInterceptVerdict::Keep];
+                    }
                 }
-                Err((_rf, err)) => {
-                    panic!("{:?}", err);
-                }
-                _ => {
-                    return vec![SnarfInterceptVerdict::Keep];
-                }
-            }
-        } else if let Some(mut writable) = writable {
-            let mut seq = u32::from_be_bytes([
-                tcp_header[TCP_SEQ_OFFSET],
-                tcp_header[TCP_SEQ_OFFSET + 1],
-                tcp_header[TCP_SEQ_OFFSET + 2],
-                tcp_header[TCP_SEQ_OFFSET + 3],
-            ]);
-            seq = seq.wrapping_add(retransmitted as u32);
+            } else if let Some(mut writable) = writable {
+                let mut seq = u32::from_be_bytes([
+                    tcp_header[TCP_SEQ_OFFSET],
+                    tcp_header[TCP_SEQ_OFFSET + 1],
+                    tcp_header[TCP_SEQ_OFFSET + 2],
+                    tcp_header[TCP_SEQ_OFFSET + 3],
+                ]);
+                seq = seq.wrapping_add(retransmitted as u32);
 
-            let new_data = &mut data[retransmitted..];
+                let new_data = &mut data[retransmitted..];
 
-            let this_verdict = self
-                .app_data_handler
-                .on_data(session_id, is_client, seq as i64, new_data);
-            writable.copy_from_slice(new_data);
+                let this_verdict = self
+                    .app_data_handler
+                    .on_data(session_id, is_client, seq as i64, new_data);
+                writable.copy_from_slice(new_data);
 
-            (rf, this_verdict)
-        } else {
-            (rf, InterceptVerdict::Accept)
-        };
+                (rf, this_verdict)
+            } else {
+                (rf, InterceptVerdict::Accept)
+            };
 
         let mut verdicts = if remove_session {
             let verdicts = self.drain_futures_from_last_session();

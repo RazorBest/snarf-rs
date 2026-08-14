@@ -7,8 +7,9 @@ pub const TCP_DSTPORT_OFFSET: usize = 2;
 pub const TCP_DATAOFFSET_IDX: usize = 12;
 pub const TCP_FLAGS_IDX: usize = 13;
 pub const TCP_SEQ_OFFSET: usize = 4;
-pub const SYN_MASK: u8 = 0x2;
 pub const FIN_MASK: u8 = 0x1;
+pub const SYN_MASK: u8 = 0x2;
+pub const RST_MASK: u8 = 0x4;
 
 #[inline(always)]
 pub fn tcp_header_len(tcp_payload: &[u8]) -> usize {

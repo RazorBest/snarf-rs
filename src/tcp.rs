@@ -7,7 +7,9 @@ use std::time::Instant;
 
 use crate::TransportPacketParent;
 use crate::deque::{DequeSlice, DequeSliceMut};
-use crate::tcp_util::{FIN_MASK, SYN_MASK, TCP_FLAGS_IDX, tcp_fin, tcp_header_len, tcp_seq};
+use crate::tcp_util::{
+    FIN_MASK, RST_MASK, SYN_MASK, TCP_FLAGS_IDX, tcp_fin, tcp_header_len, tcp_seq,
+};
 use crate::util::CircularSeqBuffer;
 
 pub const SEQ_LIM: i64 = u32::MAX as i64 + 1;
@@ -122,11 +124,12 @@ where
     }
 }
 
-/// (Retramsitted, Write buffer, Retransmission copy)
+/// (Retramsitted, Write buffer, Retransmission copy, Closing)
 pub type TcpTrackerUpdateResult<'a> = (
     usize,
     Option<DequeSliceMut<'a, u8>>,
     Option<DequeSlice<'a, u8>>,
+    bool,
 );
 
 #[derive(Debug)]
@@ -136,6 +139,7 @@ where
 {
     pub first_seq: bool,
     pub fin: bool,
+    pub closing: bool,
 
     pub buffer: CircularSeqBuffer,
     pub future: Vec<FuturePacket<RF>>,
@@ -150,6 +154,7 @@ where
         Self {
             first_seq: false,
             fin: false,
+            closing: false,
 
             buffer: CircularSeqBuffer::new(BUFFER_SIZE),
             future: vec![],
@@ -217,11 +222,12 @@ where
             self.buffer.seq_add(1);
             self.first_seq = true;
 
-            return Ok((0, None, None));
+            return Ok((0, None, None, false));
+        } else if !self.first_seq && (flags & RST_MASK) != 0 {
+            return Ok((0, None, None, true));
         } else if !self.first_seq {
-            // This is a rare case. The connection has not encountered SYN yet
-            //  so we consider all packets to be future
-            return Ok((0, None, None));
+            // The connection has not encountered SYN yet so we consider all packets to be future
+            return Ok((0, None, None, false));
         }
 
         let next_seq = next_seq as i64;
@@ -229,7 +235,12 @@ where
         if data_len == 0 && (flags & FIN_MASK) != 0 {
             self.fin = true;
             self.buffer.update(1);
-            return Ok((data_len as usize, None, None));
+            return Ok((data_len as usize, None, None, false));
+        }
+
+        if (flags & RST_MASK) != 0 {
+            self.closing = true;
+            return Ok((0, None, None, true));
         }
 
         // 1 <= X2 - E <= window_len, otherwise it's old data or outside the window
@@ -247,13 +258,13 @@ where
             self.buffer
                 .write_from_buffer_to_slice(data, next_seq as u32);
 
-            return Ok((data_len as usize, None, None));
+            return Ok((data_len as usize, None, None, false));
         }
 
         // X1 <= E, otherwise it's future
         let old_data_len = data_len - new_data_len;
         if !(0..=buffer_len).contains(&old_data_len) {
-            return Ok((0, None, None));
+            return Ok((0, None, None, false));
         }
 
         if old_data_len > 0 {
@@ -282,6 +293,7 @@ where
             old_data_len as usize,
             Some(write_space),
             Some(remaining_space.to_immutable()),
+            false,
         ))
     }
 
@@ -291,6 +303,10 @@ where
     /// expected SEQ for the peer. Future packets can be pulled from the queue
     /// after an `update` call that provides the missing bytes before the future.
     pub fn update_future_queue<'a>(&'a mut self) -> Vec<FutureVerdict<'a, RF>> {
+        if !self.first_seq {
+            return vec![];
+        }
+
         let start_end = self.buffer.end;
 
         let mut shallow_verdicts = vec![];
@@ -434,6 +450,7 @@ pub type TcpParseResult<'a> = (
     usize,
     Option<DequeSliceMut<'a, u8>>,
     Option<DequeSlice<'a, u8>>,
+    bool,
 );
 
 #[derive(Debug)]
@@ -496,14 +513,16 @@ where
 
         if self.src_net == src_net && self.src_port == src_port {
             is_client = true;
-            let (retransmitted, writable, remaining) = self.src_tracker.update(flags, seq, data)?;
+            let (retransmitted, writable, remaining, closing) =
+                self.src_tracker.update(flags, seq, data)?;
 
-            Ok((is_client, retransmitted, writable, remaining))
+            Ok((is_client, retransmitted, writable, remaining, closing))
         } else {
             is_client = false;
-            let (retransmitted, writable, remaining) = self.dst_tracker.update(flags, seq, data)?;
+            let (retransmitted, writable, remaining, closing) =
+                self.dst_tracker.update(flags, seq, data)?;
 
-            Ok((is_client, retransmitted, writable, remaining))
+            Ok((is_client, retransmitted, writable, remaining, closing))
         }
     }
 
@@ -552,7 +571,7 @@ mod helpers_test_tcp_peer_tracker {
         ) -> Result<(usize, usize, Vec<u8>)> {
             const DUMMY_HEADER_LEN: usize = 21;
             let mut buf = data.to_vec();
-            let (retransmitted, writable, _) = self.update(flags, next_seq, &mut buf)?;
+            let (retransmitted, writable, _, _) = self.update(flags, next_seq, &mut buf)?;
 
             if let Some(mut writable) = writable {
                 writable.copy_from_slice(&data[retransmitted..]);
@@ -573,7 +592,7 @@ mod helpers_test_tcp_peer_tracker {
         ) -> Result<usize> {
             const DUMMY_HEADER_LEN: usize = 21;
             let mut buf = data.to_vec();
-            let (retransmitted, writable, _) = self.update(flags, next_seq, &mut buf)?;
+            let (retransmitted, writable, _, _) = self.update(flags, next_seq, &mut buf)?;
 
             assert!(retransmitted == 0);
             assert!(buf == data);
@@ -606,6 +625,7 @@ mod helpers_test_tcp_peer_tracker {
         TcpPeerTracker {
             first_seq: false,
             fin: false,
+            closing: false,
 
             buffer: CircularSeqBuffer::new(BUFFER_SIZE),
             future: vec![],
