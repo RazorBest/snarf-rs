@@ -44,6 +44,9 @@ pub trait NetworkSnarfHandler<RF> {
 }
 
 pub trait TransportSnarfHandler<NetAddr, RF> {
+    /*
+     * Handles a TCP packet. Must guarantee that the packet is eventually
+     * returned back in the verdict vector after subsequent calls.*/
     fn on_transport_packet(
         &mut self,
         src_ip: NetAddr,
@@ -504,8 +507,8 @@ impl TransportPacketParent for NfqMessageParent {
 pub struct SnarfTcp<AH, TSpy, NetAddr, RF>
 where
     AH: ApplicationDataSnarfHandler,
-    NetAddr: Copy + Hash + Ord + Default,
     TSpy: TransportSnarfSpy,
+    NetAddr: Copy + Hash + Ord + Default,
     RF: TransportPacketParent,
 {
     pub sessions: TcpSessionMap<NetAddr, RF>,
