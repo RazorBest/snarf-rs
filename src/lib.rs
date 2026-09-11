@@ -85,6 +85,7 @@ pub trait TransportSnarfSpy {
         session_id: u64,
         verdict: &InterceptVerdict,
     );
+    fn close(&mut self, is_client: bool, session_id: u64);
 }
 
 impl TransportSnarfSpy for NoSpy {
@@ -106,6 +107,7 @@ impl TransportSnarfSpy for NoSpy {
         _verdict: &InterceptVerdict,
     ) {
     }
+    fn close(&mut self, _is_client: bool, _session_id: u64) {}
 }
 
 #[derive(Clone)]
@@ -656,6 +658,11 @@ where
             session_id,
             &this_verdict,
         );
+
+        if remove_session {
+            self.transport_spy.close(false, session_id);
+            self.transport_spy.close(true, session_id);
+        }
 
         match this_verdict {
             InterceptVerdict::Accept => {
