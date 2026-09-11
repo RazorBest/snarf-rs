@@ -217,11 +217,13 @@ where
             return Err(PacketTooBigError);
         }
 
-        if (flags & SYN_MASK) != 0 && !self.first_seq {
+        if (flags & SYN_MASK) != 0 && (!self.first_seq || self.fin) {
+            let new_connection = self.fin;
             self.buffer.fill_zero();
             self.buffer.seq = next_seq;
             self.buffer.seq_add(1);
             self.first_seq = true;
+            self.fin = false;
 
             return Ok((0, None, None, false));
         } else if !self.first_seq && (flags & RST_MASK) != 0 {
