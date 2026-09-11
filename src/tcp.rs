@@ -124,11 +124,12 @@ where
     }
 }
 
-/// (Retramsitted, Write buffer, Retransmission copy, Closing)
+/// (Retramsitted, Write buffer, Retransmission copy, Closing, NewConnection)
 pub type TcpTrackerUpdateResult<'a> = (
     usize,
     Option<DequeSliceMut<'a, u8>>,
     Option<DequeSlice<'a, u8>>,
+    bool,
     bool,
 );
 
@@ -225,12 +226,12 @@ where
             self.first_seq = true;
             self.fin = false;
 
-            return Ok((0, None, None, false));
+            return Ok((0, None, None, false, new_connection));
         } else if !self.first_seq && (flags & RST_MASK) != 0 {
-            return Ok((0, None, None, true));
+            return Ok((0, None, None, false, false));
         } else if !self.first_seq {
             // The connection has not encountered SYN yet so we consider all packets to be future
-            return Ok((0, None, None, false));
+            return Ok((0, None, None, false, false));
         }
 
         let next_seq = next_seq as i64;
@@ -238,12 +239,12 @@ where
         if data_len == 0 && (flags & FIN_MASK) != 0 {
             self.fin = true;
             self.buffer.update(1);
-            return Ok((data_len as usize, None, None, false));
+            return Ok((data_len as usize, None, None, false, false));
         }
 
         if (flags & RST_MASK) != 0 {
             self.closing = true;
-            return Ok((0, None, None, true));
+            return Ok((0, None, None, true, false));
         }
 
         // 1 <= X2 - E <= window_len, otherwise it's old data or outside the window
@@ -261,13 +262,13 @@ where
             self.buffer
                 .write_from_buffer_to_slice(data, next_seq as u32);
 
-            return Ok((data_len as usize, None, None, false));
+            return Ok((data_len as usize, None, None, false, false));
         }
 
         // X1 <= E, otherwise it's future
         let old_data_len = data_len - new_data_len;
         if !(0..=buffer_len).contains(&old_data_len) {
-            return Ok((0, None, None, false));
+            return Ok((0, None, None, false, false));
         }
 
         if old_data_len > 0 {
@@ -296,6 +297,7 @@ where
             old_data_len as usize,
             Some(write_space),
             Some(remaining_space.to_immutable()),
+            false,
             false,
         ))
     }
@@ -454,6 +456,7 @@ pub type TcpParseResult<'a> = (
     Option<DequeSliceMut<'a, u8>>,
     Option<DequeSlice<'a, u8>>,
     bool,
+    bool,
 );
 
 #[derive(Debug)]
@@ -516,16 +519,30 @@ where
 
         if self.src_net == src_net && self.src_port == src_port {
             is_client = true;
-            let (retransmitted, writable, remaining, closing) =
+            let (retransmitted, writable, remaining, closing, new_connection) =
                 self.src_tracker.update(flags, seq, data)?;
 
-            Ok((is_client, retransmitted, writable, remaining, closing))
+            Ok((
+                is_client,
+                retransmitted,
+                writable,
+                remaining,
+                closing,
+                new_connection,
+            ))
         } else {
             is_client = false;
-            let (retransmitted, writable, remaining, closing) =
+            let (retransmitted, writable, remaining, closing, new_connection) =
                 self.dst_tracker.update(flags, seq, data)?;
 
-            Ok((is_client, retransmitted, writable, remaining, closing))
+            Ok((
+                is_client,
+                retransmitted,
+                writable,
+                remaining,
+                closing,
+                new_connection,
+            ))
         }
     }
 
@@ -574,7 +591,7 @@ mod helpers_test_tcp_peer_tracker {
         ) -> Result<(usize, usize, Vec<u8>)> {
             const DUMMY_HEADER_LEN: usize = 21;
             let mut buf = data.to_vec();
-            let (retransmitted, writable, _, _) = self.update(flags, next_seq, &mut buf)?;
+            let (retransmitted, writable, _, _, _) = self.update(flags, next_seq, &mut buf)?;
 
             if let Some(mut writable) = writable {
                 writable.copy_from_slice(&data[retransmitted..]);
@@ -595,7 +612,7 @@ mod helpers_test_tcp_peer_tracker {
         ) -> Result<usize> {
             const DUMMY_HEADER_LEN: usize = 21;
             let mut buf = data.to_vec();
-            let (retransmitted, writable, _, _) = self.update(flags, next_seq, &mut buf)?;
+            let (retransmitted, writable, _, _, _) = self.update(flags, next_seq, &mut buf)?;
 
             assert!(retransmitted == 0);
             assert!(buf == data);

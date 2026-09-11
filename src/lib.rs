@@ -553,6 +553,7 @@ where
         dst_net: NetAddr,
         mut rf: RF,
     ) -> Vec<SnarfInterceptVerdict<RF>> {
+        let mut verdicts = vec![];
         let (net_header, tcp_payload) = rf.split();
         let src_port = u16::from_be_bytes([
             tcp_payload[TCP_SRCPORT_OFFSET],
@@ -566,19 +567,33 @@ where
 
         let src_addr = TcpAddr::new(src_net, src_port);
         let dst_addr = TcpAddr::new(dst_net, dst_port);
-        self.last_used_key = Some((src_addr, dst_addr));
-        let &mut TcpSessionWithId {
-            ref mut session,
-            session_id,
-        } = self.sessions.get_session(src_addr, dst_addr);
-
         let (tcp_header, data) = tcp_payload[..].split_at(header_len);
+
+        self.last_used_key = Some((src_addr, dst_addr));
+        let result = self.sessions.get_session(src_addr, dst_addr);
+        let mut session = &mut result.session;
+        let mut session_id = result.session_id;
+
         self.transport_spy
             .before(net_header, tcp_header, data, session_id);
 
-        let (is_client, retransmitted, writable, _, closing) = session
-            .read_tcp_packet(src_net, src_port, tcp_payload)
-            .unwrap();
+        let (mut is_client, mut retransmitted, mut writable, _, mut closing, new_connection) =
+            session
+                .read_tcp_packet(src_net, src_port, tcp_payload)
+                .unwrap();
+
+        if new_connection {
+            verdicts.append(&mut self.drain_futures_from_last_session());
+            self.sessions.remove_session(src_addr, dst_addr);
+
+            let result = self.sessions.get_session(src_addr, dst_addr);
+            session = &mut result.session;
+            session_id = result.session_id;
+
+            (is_client, retransmitted, writable, _, closing, _) = session
+                .read_tcp_packet(src_net, src_port, tcp_payload)
+                .unwrap();
+        };
 
         self.last_is_client = is_client;
 
@@ -622,14 +637,12 @@ where
                 (rf, InterceptVerdict::Accept)
             };
 
-        let mut verdicts = if remove_session {
-            let verdicts = self.drain_futures_from_last_session();
+        if remove_session {
+            verdicts.append(&mut self.drain_futures_from_last_session());
             self.sessions.remove_session(src_addr, dst_addr);
-
-            verdicts
         } else {
-            self.transport_packet_verdict_kept()
-        };
+            verdicts.append(&mut self.transport_packet_verdict_kept());
+        }
 
         let (net_header, tcp_payload) = rf.split();
         let header_len = tcp_header_len(tcp_payload);
