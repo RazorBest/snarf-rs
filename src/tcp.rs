@@ -218,6 +218,7 @@ where
         }
 
         if (flags & SYN_MASK) != 0 && !self.first_seq {
+            self.buffer.fill_zero();
             self.buffer.seq = next_seq;
             self.buffer.seq_add(1);
             self.first_seq = true;

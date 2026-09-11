@@ -120,6 +120,10 @@ impl CircularSeqBuffer {
         let (mut write_space, _) = self.update_and_return_split_ref(data.len());
         write_space.copy_from_slice(data);
     }
+
+    pub fn fill_zero(&mut self) {
+        self.buffer.fill(0);
+    }
 }
 
 pub fn update_checksum_ipv4_tcp_packet(ip_packet: &mut [u8]) {
