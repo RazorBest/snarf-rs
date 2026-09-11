@@ -230,7 +230,7 @@ where
             return Ok((0, None, None, false, new_connection));
         } else if self.closed {
             return Ok((0, None, None, false, false));
-        } else if !self.first_seq && (flags & RST_MASK) != 0 {
+        } else if (flags & RST_MASK) != 0 {
             self.closed = true;
             return Ok((0, None, None, true, false));
         } else if !self.first_seq {
