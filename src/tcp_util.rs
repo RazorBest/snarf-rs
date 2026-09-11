@@ -10,6 +10,11 @@ pub const TCP_SEQ_OFFSET: usize = 4;
 pub const FIN_MASK: u8 = 0x1;
 pub const SYN_MASK: u8 = 0x2;
 pub const RST_MASK: u8 = 0x4;
+pub const PSH_MASK: u8 = 0x8;
+pub const ACK_MASK: u8 = 0x10;
+pub const URG_MASK: u8 = 0x20;
+pub const ECE_MASK: u8 = 0x40;
+pub const CWR_MASK: u8 = 0x80;
 
 #[inline(always)]
 pub fn tcp_header_len(tcp_payload: &[u8]) -> usize {

@@ -33,6 +33,7 @@ pub enum SnarfInterceptVerdict<RF> {
     Keep,
 }
 
+#[derive(Clone)]
 pub enum InterceptVerdict {
     Accept,
     Drop,
@@ -43,6 +44,9 @@ pub trait NetworkSnarfHandler<RF> {
 }
 
 pub trait TransportSnarfHandler<NetAddr, RF> {
+    /*
+     * Handles a TCP packet. Must guarantee that the packet is eventually
+     * returned back in the verdict vector after subsequent calls.*/
     fn on_transport_packet(
         &mut self,
         src_ip: NetAddr,
@@ -85,6 +89,7 @@ pub trait TransportSnarfSpy {
         session_id: u64,
         verdict: &InterceptVerdict,
     );
+    fn close(&mut self, is_client: bool, session_id: u64);
 }
 
 impl TransportSnarfSpy for NoSpy {
@@ -106,6 +111,7 @@ impl TransportSnarfSpy for NoSpy {
         _verdict: &InterceptVerdict,
     ) {
     }
+    fn close(&mut self, _is_client: bool, _session_id: u64) {}
 }
 
 #[derive(Clone)]
@@ -501,8 +507,8 @@ impl TransportPacketParent for NfqMessageParent {
 pub struct SnarfTcp<AH, TSpy, NetAddr, RF>
 where
     AH: ApplicationDataSnarfHandler,
-    NetAddr: Copy + Hash + Ord + Default,
     TSpy: TransportSnarfSpy,
+    NetAddr: Copy + Hash + Ord + Default,
     RF: TransportPacketParent,
 {
     pub sessions: TcpSessionMap<NetAddr, RF>,
@@ -553,6 +559,7 @@ where
         dst_net: NetAddr,
         mut rf: RF,
     ) -> Vec<SnarfInterceptVerdict<RF>> {
+        let mut verdicts = vec![];
         let (net_header, tcp_payload) = rf.split();
         let src_port = u16::from_be_bytes([
             tcp_payload[TCP_SRCPORT_OFFSET],
@@ -566,19 +573,33 @@ where
 
         let src_addr = TcpAddr::new(src_net, src_port);
         let dst_addr = TcpAddr::new(dst_net, dst_port);
-        self.last_used_key = Some((src_addr, dst_addr));
-        let &mut TcpSessionWithId {
-            ref mut session,
-            session_id,
-        } = self.sessions.get_session(src_addr, dst_addr);
-
         let (tcp_header, data) = tcp_payload[..].split_at(header_len);
+
+        self.last_used_key = Some((src_addr, dst_addr));
+        let result = self.sessions.get_session(src_addr, dst_addr);
+        let mut session = &mut result.session;
+        let mut session_id = result.session_id;
+
         self.transport_spy
             .before(net_header, tcp_header, data, session_id);
 
-        let (is_client, retransmitted, writable, _, closing) = session
-            .read_tcp_packet(src_net, src_port, tcp_payload)
-            .unwrap();
+        let (mut is_client, mut retransmitted, mut writable, _, mut closing, new_connection) =
+            session
+                .read_tcp_packet(src_net, src_port, tcp_payload)
+                .unwrap();
+
+        if new_connection {
+            verdicts.append(&mut self.drain_futures_from_last_session());
+            self.sessions.remove_session(src_addr, dst_addr);
+
+            let result = self.sessions.get_session(src_addr, dst_addr);
+            session = &mut result.session;
+            session_id = result.session_id;
+
+            (is_client, retransmitted, writable, _, closing, _) = session
+                .read_tcp_packet(src_net, src_port, tcp_payload)
+                .unwrap();
+        };
 
         self.last_is_client = is_client;
 
@@ -622,14 +643,12 @@ where
                 (rf, InterceptVerdict::Accept)
             };
 
-        let mut verdicts = if remove_session {
-            let verdicts = self.drain_futures_from_last_session();
+        if remove_session {
+            verdicts.append(&mut self.drain_futures_from_last_session());
             self.sessions.remove_session(src_addr, dst_addr);
-
-            verdicts
         } else {
-            self.transport_packet_verdict_kept()
-        };
+            verdicts.append(&mut self.transport_packet_verdict_kept());
+        }
 
         let (net_header, tcp_payload) = rf.split();
         let header_len = tcp_header_len(tcp_payload);
@@ -643,6 +662,11 @@ where
             session_id,
             &this_verdict,
         );
+
+        if remove_session {
+            self.transport_spy.close(false, session_id);
+            self.transport_spy.close(true, session_id);
+        }
 
         match this_verdict {
             InterceptVerdict::Accept => {
@@ -838,5 +862,396 @@ impl SnarfNfqIpv4TcpOptions {
         TSpy: TransportSnarfSpy,
     {
         SnarfNfqIpv4Tcp::new_from_handlers(&self.into(), app_handler, net_spy, transport_spy)
+    }
+}
+
+#[cfg(test)]
+mod test_snarf_tcp {
+    use super::*;
+    use crate::ipv4_util::ipv4_header_len;
+    use crate::tcp_util::{
+        ACK_MASK, CWR_MASK, ECE_MASK, FIN_MASK, PSH_MASK, RST_MASK, SYN_MASK, URG_MASK,
+    };
+    use etherparse::{PacketBuilder, TcpHeader};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct AHDummy {}
+    impl ApplicationDataSnarfHandler for AHDummy {
+        fn on_data(
+            &mut self,
+            _session_id: u64,
+            _is_client: bool,
+            _counter: i64,
+            _data: &mut [u8],
+        ) -> InterceptVerdict {
+            InterceptVerdict::Accept
+        }
+    }
+
+    #[allow(dead_code)]
+    struct PacketEvent {
+        net_header: Vec<u8>,
+        transport_header: Vec<u8>,
+        data: Vec<u8>,
+        session_id: u64,
+        // Is some when inside a SpyEvent::After or SpyEvent::Close
+        is_client: Option<bool>,
+        // Is some when inside a SpyEvent::After
+        verdict: Option<InterceptVerdict>,
+    }
+
+    impl PacketEvent {
+        fn new(
+            net_header: &[u8],
+            transport_header: &[u8],
+            data: &[u8],
+            session_id: u64,
+            is_client: Option<bool>,
+            verdict: Option<InterceptVerdict>,
+        ) -> Self {
+            Self {
+                net_header: net_header.to_vec(),
+                transport_header: transport_header.to_vec(),
+                data: data.to_vec(),
+                session_id,
+                is_client,
+                verdict,
+            }
+        }
+    }
+
+    enum SpyEvent {
+        Before(PacketEvent),
+        After(PacketEvent),
+        Close(PacketEvent),
+    }
+
+    #[derive(Default)]
+    struct TSpy {
+        events: Vec<SpyEvent>,
+    }
+
+    impl TransportSnarfSpy for TSpy {
+        fn before(
+            &mut self,
+            net_header: &[u8],
+            transport_header: &[u8],
+            data: &[u8],
+            session_id: u64,
+        ) {
+            self.events.push(SpyEvent::Before(PacketEvent::new(
+                net_header,
+                transport_header,
+                data,
+                session_id,
+                None,
+                None,
+            )));
+        }
+        fn after(
+            &mut self,
+            net_header: &[u8],
+            transport_header: &[u8],
+            is_client: bool,
+            data: &[u8],
+            session_id: u64,
+            verdict: &InterceptVerdict,
+        ) {
+            self.events.push(SpyEvent::After(PacketEvent::new(
+                net_header,
+                transport_header,
+                data,
+                session_id,
+                Some(is_client),
+                Some(verdict.clone()),
+            )));
+        }
+        fn close(&mut self, is_client: bool, session_id: u64) {
+            self.events.push(SpyEvent::Close(PacketEvent::new(
+                &[],
+                &[],
+                &[],
+                session_id,
+                Some(is_client),
+                None,
+            )));
+        }
+    }
+
+    impl TransportSnarfSpy for Rc<RefCell<TSpy>> {
+        fn before(
+            &mut self,
+            net_header: &[u8],
+            transport_header: &[u8],
+            data: &[u8],
+            session_id: u64,
+        ) {
+            self.borrow_mut()
+                .before(net_header, transport_header, data, session_id)
+        }
+        fn after(
+            &mut self,
+            net_header: &[u8],
+            transport_header: &[u8],
+            is_client: bool,
+            data: &[u8],
+            session_id: u64,
+            verdict: &InterceptVerdict,
+        ) {
+            self.borrow_mut().after(
+                net_header,
+                transport_header,
+                is_client,
+                data,
+                session_id,
+                verdict,
+            )
+        }
+        fn close(&mut self, is_client: bool, session_id: u64) {
+            self.borrow_mut().close(is_client, session_id)
+        }
+    }
+
+    struct TParent {
+        id: u64,
+        ip: Vec<u8>,
+        tcp: Vec<u8>,
+    }
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    impl TParent {
+        fn new(ip: Vec<u8>, tcp: Vec<u8>) -> Self {
+            Self {
+                id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+                ip,
+                tcp,
+            }
+        }
+    }
+
+    impl TransportPacketParent for TParent {
+        fn split(&mut self) -> (&[u8], &mut [u8]) {
+            (&self.ip, &mut self.tcp)
+        }
+    }
+
+    type THandler = SnarfTcp<AHDummy, Rc<RefCell<TSpy>>, Ipv4Type, TParent>;
+
+    fn new_transport_handler() -> THandler {
+        let tspy = Rc::new(RefCell::new(TSpy::default()));
+        THandler::new_from(AHDummy {}, tspy)
+    }
+
+    struct TcpConnection {
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+    }
+
+    impl TcpConnection {
+        const fn new(src_ip: [u8; 4], dst_ip: [u8; 4], src_port: u16, dst_port: u16) -> Self {
+            Self {
+                src_ip,
+                dst_ip,
+                src_port,
+                dst_port,
+            }
+        }
+
+        /// Returns the reversed connection
+        fn rev(&self) -> Self {
+            Self {
+                src_ip: self.dst_ip,
+                dst_ip: self.src_ip,
+                src_port: self.dst_port,
+                dst_port: self.src_port,
+            }
+        }
+
+        fn get_addr(&self) -> (TcpAddr<Ipv4Type>, TcpAddr<Ipv4Type>) {
+            let src_addr = TcpAddr::new(self.src_ip, self.src_port);
+            let dst_addr = TcpAddr::new(self.dst_ip, self.dst_port);
+
+            (src_addr, dst_addr)
+        }
+    }
+
+    const TCP_CONNS: [TcpConnection; 4] = [
+        TcpConnection::new([192, 138, 26, 100], [192, 198, 26, 100], 1024, 1024),
+        TcpConnection::new([192, 138, 26, 100], [192, 138, 26, 100], 80, 123),
+        TcpConnection::new([108, 138, 26, 100], [192, 198, 26, 100], 123, 124),
+        TcpConnection::new([108, 138, 26, 100], [182, 198, 106, 80], 223, 224),
+    ];
+
+    fn gen_packet(
+        conn: &TcpConnection,
+        payload: &[u8],
+        seq: u32,
+        ack: Option<u32>,
+        flags: u8,
+    ) -> TParent {
+        let ttl = 64;
+        let window_size = u16::MAX;
+
+        let mut tcp_header = TcpHeader::new(conn.src_port, conn.dst_port, seq, window_size);
+        tcp_header.fin = (flags & FIN_MASK) != 0;
+        tcp_header.syn = (flags & SYN_MASK) != 0;
+        tcp_header.rst = (flags & RST_MASK) != 0;
+        tcp_header.psh = (flags & PSH_MASK) != 0;
+        tcp_header.ack = ack.is_some() || ((flags & ACK_MASK) != 0);
+        tcp_header.urg = (flags & URG_MASK) != 0;
+        tcp_header.ece = (flags & ECE_MASK) != 0;
+        tcp_header.cwr = (flags & CWR_MASK) != 0;
+        if let Some(ack) = ack {
+            tcp_header.acknowledgment_number = ack;
+        }
+
+        let builder = PacketBuilder::ipv4(conn.src_ip, conn.dst_ip, ttl).tcp_header(tcp_header);
+
+        let mut ip_packet = vec![];
+        builder.write(&mut ip_packet, payload).unwrap();
+
+        let ip_len = ipv4_header_len(&ip_packet) as usize;
+        let tcp_segment = ip_packet.split_off(ip_len);
+
+        TParent::new(ip_packet, tcp_segment)
+    }
+
+    fn packet_expect_accept(th: &mut THandler, conn: &TcpConnection, packet: TParent) {
+        let packet_id = packet.id;
+        let verdicts = th.on_transport_packet(conn.src_ip, conn.dst_ip, packet);
+        assert!(
+            !verdicts.is_empty(),
+            "The tcp handler must return a verdict"
+        );
+        assert!(
+            matches!(verdicts[0], SnarfInterceptVerdict::Accept(..)),
+            "The tcp handler's verdict must be ACCEPT"
+        );
+        let SnarfInterceptVerdict::Accept(rf) = &verdicts[0] else {
+            panic!("The tcp handler's verdict must be ACCEPT");
+        };
+        assert_eq!(
+            rf.id, packet_id,
+            "The returned verdict must be for the provided packet"
+        );
+
+        let session_id = {
+            let (src, dst) = conn.get_addr();
+            let res = th.sessions.get_session(src, dst);
+
+            res.session_id
+        };
+
+        let events = &mut th.transport_spy.borrow_mut().events;
+        assert!(events.len() == 2);
+        let SpyEvent::Before(e) = events.remove(0) else {
+            panic!("Expected 'before' event");
+        };
+        assert_eq!(e.session_id, session_id);
+        let SpyEvent::After(e) = events.remove(0) else {
+            panic!("Expected 'after' event");
+        };
+        assert_eq!(e.session_id, session_id);
+    }
+
+    fn packet_expect_close(th: &mut THandler, conn: &TcpConnection, packet: TParent) {
+        let packet_id = packet.id;
+        let session_id = {
+            let (src, dst) = conn.get_addr();
+            let res = th.sessions.get_session(src, dst);
+
+            res.session_id
+        };
+
+        let verdicts = th.on_transport_packet(conn.src_ip, conn.dst_ip, packet);
+        assert!(
+            !verdicts.is_empty(),
+            "The tcp handler must return a verdict"
+        );
+        assert!(
+            matches!(verdicts[0], SnarfInterceptVerdict::Accept(..)),
+            "The tcp handler's verdict must be ACCEPT"
+        );
+        let SnarfInterceptVerdict::Accept(rf) = &verdicts[0] else {
+            panic!("The tcp handler's verdict must be ACCEPT");
+        };
+        assert_eq!(
+            rf.id, packet_id,
+            "The returned verdict must be for the provided packet"
+        );
+
+        let events = &mut th.transport_spy.borrow_mut().events;
+        assert!(events.len() == 4);
+        let SpyEvent::Before(e) = events.remove(0) else {
+            panic!("Expected 'before' event");
+        };
+        assert_eq!(e.session_id, session_id);
+
+        let SpyEvent::After(e) = events.remove(0) else {
+            panic!("Expected 'after' event");
+        };
+        assert_eq!(e.session_id, session_id);
+
+        let SpyEvent::Close(e1) = events.remove(0) else {
+            panic!("Expected 'after' event");
+        };
+        let SpyEvent::Close(e2) = events.remove(0) else {
+            panic!("Expected 'after' event");
+        };
+        assert_ne!(e1.is_client, e2.is_client);
+        assert_eq!(e1.session_id, session_id);
+        assert_eq!(e2.session_id, session_id);
+
+        events.clear();
+    }
+
+    #[test]
+    fn test_rst_after_syn() {
+        let mut th = new_transport_handler();
+        let conn = &TCP_CONNS[0];
+
+        let packet = gen_packet(conn, &[], 1000, None, SYN_MASK);
+        packet_expect_accept(&mut th, conn, packet);
+
+        let packet = gen_packet(&conn.rev(), &[], 0, Some(1001), RST_MASK);
+        packet_expect_close(&mut th, &conn.rev(), packet);
+    }
+
+    #[test]
+    fn test_rst_after_synack() {
+        let mut th = new_transport_handler();
+        let conn = &TCP_CONNS[0];
+
+        let packet = gen_packet(conn, &[], 1000, None, SYN_MASK);
+        packet_expect_accept(&mut th, conn, packet);
+
+        let packet = gen_packet(&conn.rev(), &[], 3000, Some(1001), SYN_MASK | ACK_MASK);
+        packet_expect_accept(&mut th, &conn.rev(), packet);
+
+        let packet = gen_packet(conn, &[], 1001, Some(3001), RST_MASK);
+        packet_expect_close(&mut th, conn, packet);
+    }
+
+    #[test]
+    fn test_rst_after_establish() {
+        let mut th = new_transport_handler();
+        let conn = &TCP_CONNS[0];
+
+        let packet = gen_packet(conn, &[], 1000, None, SYN_MASK);
+        packet_expect_accept(&mut th, conn, packet);
+
+        let packet = gen_packet(&conn.rev(), &[], 3000, Some(1001), SYN_MASK | ACK_MASK);
+        packet_expect_accept(&mut th, &conn.rev(), packet);
+
+        let packet = gen_packet(conn, &[], 1001, Some(3001), ACK_MASK);
+        packet_expect_accept(&mut th, conn, packet);
+
+        let packet = gen_packet(&conn.rev(), &[], 3001, Some(1001), RST_MASK);
+        packet_expect_close(&mut th, &conn.rev(), packet);
     }
 }
