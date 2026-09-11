@@ -140,7 +140,7 @@ where
 {
     pub first_seq: bool,
     pub fin: bool,
-    pub closing: bool,
+    pub closed: bool,
 
     pub buffer: CircularSeqBuffer,
     pub future: Vec<FuturePacket<RF>>,
@@ -155,7 +155,7 @@ where
         Self {
             first_seq: false,
             fin: false,
-            closing: false,
+            closed: false,
 
             buffer: CircularSeqBuffer::new(BUFFER_SIZE),
             future: vec![],
@@ -218,17 +218,21 @@ where
             return Err(PacketTooBigError);
         }
 
-        if (flags & SYN_MASK) != 0 && (!self.first_seq || self.fin) {
-            let new_connection = self.fin;
+        if (flags & SYN_MASK) != 0 && (!self.first_seq || self.fin || self.closed) {
+            let new_connection = self.fin || self.closed;
             self.buffer.fill_zero();
             self.buffer.seq = next_seq;
             self.buffer.seq_add(1);
             self.first_seq = true;
             self.fin = false;
+            self.closed = false;
 
             return Ok((0, None, None, false, new_connection));
-        } else if !self.first_seq && (flags & RST_MASK) != 0 {
+        } else if self.closed {
             return Ok((0, None, None, false, false));
+        } else if !self.first_seq && (flags & RST_MASK) != 0 {
+            self.closed = true;
+            return Ok((0, None, None, true, false));
         } else if !self.first_seq {
             // The connection has not encountered SYN yet so we consider all packets to be future
             return Ok((0, None, None, false, false));
@@ -240,11 +244,6 @@ where
             self.fin = true;
             self.buffer.update(1);
             return Ok((data_len as usize, None, None, false, false));
-        }
-
-        if (flags & RST_MASK) != 0 {
-            self.closing = true;
-            return Ok((0, None, None, true, false));
         }
 
         // 1 <= X2 - E <= window_len, otherwise it's old data or outside the window
@@ -645,7 +644,7 @@ mod helpers_test_tcp_peer_tracker {
         TcpPeerTracker {
             first_seq: false,
             fin: false,
-            closing: false,
+            closed: false,
 
             buffer: CircularSeqBuffer::new(BUFFER_SIZE),
             future: vec![],
