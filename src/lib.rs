@@ -5,6 +5,7 @@
 pub mod deque;
 pub mod ipv4_util;
 pub mod tcp;
+pub mod tcp_tracker;
 pub mod tcp_util;
 pub mod util;
 
@@ -22,6 +23,9 @@ use etherparse::{
 use tokio::io::unix::AsyncFd;
 
 use crate::tcp::{SnarfTcpError, TcpSession};
+use crate::tcp_tracker::{
+    TcpTrackerPlungeResult
+};
 use crate::tcp_util::{
     TCP_DSTPORT_OFFSET, TCP_SEQ_OFFSET, TCP_SRCPORT_OFFSET, tcp_header_len,
     update_checksum_tcp_ipv4,
@@ -31,6 +35,16 @@ pub enum SnarfInterceptVerdict<RF> {
     Accept(RF),
     Drop(RF),
     Keep,
+}
+
+impl<RF> SnarfInterceptVerdict<RF> {
+    pub fn to_intercept_verdict(&self) -> Option<InterceptVerdict> {
+        match self {
+            Self::Accept(..) => Some(InterceptVerdict::Accept),
+            Self::Drop(..) => Some(InterceptVerdict::Drop),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -55,14 +69,15 @@ pub trait TransportSnarfHandler<NetAddr, RF> {
     ) -> Vec<SnarfInterceptVerdict<RF>>;
 }
 
-pub trait ApplicationDataSnarfHandler {
+pub trait ApplicationDataSnarfHandler<RF> {
     fn on_data(
         &mut self,
         session_id: u64,
         is_client: bool,
         counter: i64,
         data: &mut [u8],
-    ) -> InterceptVerdict;
+        rf: RF,
+    ) -> Vec<SnarfInterceptVerdict<RF>>;
 }
 
 #[derive(Default)]
@@ -503,10 +518,33 @@ impl TransportPacketParent for NfqMessageParent {
     }
 }
 
+#[derive(Debug)]
+pub struct TcpRiseInputParent<RF>
+where
+    RF: TransportPacketParent,
+{
+    pub is_client: bool,
+    pub tcp_input: WindOrRiseInput,
+    pub child: RF,
+}
+
+impl<RF> TcpRiseInputParent<RF>
+where
+    RF: TransportPacketParent,
+{
+    pub fn new(is_client: bool, tcp_input: WindOrRiseInput, rf: RF) -> Self {
+        Self {
+            is_client,
+            tcp_input,
+            rf,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SnarfTcp<AH, TSpy, NetAddr, RF>
 where
-    AH: ApplicationDataSnarfHandler,
+    AH: ApplicationDataSnarfHandler<RF>,
     TSpy: TransportSnarfSpy,
     NetAddr: Copy + Hash + Ord + Default,
     RF: TransportPacketParent,
@@ -520,7 +558,7 @@ where
 
 impl<AH, TSpy, NetAddr, RF> SnarfTcp<AH, TSpy, NetAddr, RF>
 where
-    AH: ApplicationDataSnarfHandler,
+    AH: ApplicationDataSnarfHandler<RF>,
     TSpy: TransportSnarfSpy,
     NetAddr: Copy + Hash + Ord + Default,
     RF: TransportPacketParent,
@@ -550,7 +588,7 @@ impl<NetAddr, TSpy, AH, RF> TransportSnarfHandler<NetAddr, RF> for SnarfTcp<AH, 
 where
     NetAddr: Copy + Hash + Ord + Default,
     TSpy: TransportSnarfSpy,
-    AH: ApplicationDataSnarfHandler,
+    AH: ApplicationDataSnarfHandler<RF>,
     RF: TransportPacketParent,
 {
     fn on_transport_packet(
@@ -576,44 +614,49 @@ where
         let (tcp_header, data) = tcp_payload[..].split_at(header_len);
 
         self.last_used_key = Some((src_addr, dst_addr));
-        let result = self.sessions.get_session(src_addr, dst_addr);
-        let mut session = &mut result.session;
-        let mut session_id = result.session_id;
+        let res = self.sessions.get_session(src_addr, dst_addr);
+        let mut session = &mut res.session;
+        let mut session_id = res.session_id;
 
         self.transport_spy
             .before(net_header, tcp_header, data, session_id);
 
-        let (mut is_client, mut retransmitted, mut writable, _, mut closing, new_connection) =
+        // TODO; remove comment
+        // let (mut is_client, mut retransmitted, mut is_future, mut closing, new_connection, to_drop) =
+        let wind_input =
             session
-                .read_tcp_packet(src_net, src_port, tcp_payload)
+                .plunge_tcp_packet(src_net, src_port, tcp_payload)
                 .unwrap();
 
-        if new_connection {
+        if wind_input.new_connection() {
+            // TODO: removing the session is not enough. We also have to ask the app layer
+            // to give back the kept payloads
             verdicts.append(&mut self.drain_futures_from_last_session());
             self.sessions.remove_session(src_addr, dst_addr);
 
-            let result = self.sessions.get_session(src_addr, dst_addr);
-            session = &mut result.session;
-            session_id = result.session_id;
+            let res = self.sessions.get_session(src_addr, dst_addr);
+            session = &mut res.session;
+            session_id = res.session_id;
 
-            (is_client, retransmitted, writable, _, closing, _) = session
-                .read_tcp_packet(src_net, src_port, tcp_payload)
+            (is_client, plunge_res) = session
+                .plunge_tcp_packet(src_net, src_port, tcp_payload)
                 .unwrap();
-        };
+        }
 
         self.last_is_client = is_client;
+        let mut remove_session = false;
 
-        let (tcp_header, data) = tcp_payload[..].split_at_mut(header_len);
-
-        let mut remove_session = closing;
-        // If packet is from future
-        let (mut rf, this_verdict) =
-            if writable.is_none() && retransmitted == 0 && !data.is_empty() && !closing {
+        let this_verdict = match wind_input.tracker_result() {
+            TcpTrackerPlungeResult::Drop => {
+                return vec![SnarfInterceptVerdict::Drop(rf)];
+            }
+            TcpTrackerPlungeResult::Future => {
                 let res = session.add_future_payload(is_client, rf);
                 match res {
+                    // This happens when we catch mid-session packets (SYN was never caught)
                     Err((rf, SnarfTcpError::FutureQueueOverflow)) => {
                         remove_session = true;
-                        (rf, InterceptVerdict::Drop)
+                        SnarfInterceptVerdict::Drop(rf)
                     }
                     Err((_rf, err)) => {
                         panic!("{:?}", err);
@@ -622,27 +665,59 @@ where
                         return vec![SnarfInterceptVerdict::Keep];
                     }
                 }
-            } else if let Some(mut writable) = writable {
+            }
+            TcpTrackerPlungeResult::Closing(wind_input) => {
+                let (rise_input, rewind_input) = session.wind(wind_input)?;
+                remove_session = true;
+                SnarfInterceptVerdict::Accept(rf)
+            }
+            TcpTrackerPlungeResult::OldData => {
+                SnarfInterceptVerdict::Accept(rf)
+            }
+            TcpTrackerPlungeResult::Rise(rise_input) => {
                 let mut seq = u32::from_be_bytes([
                     tcp_header[TCP_SEQ_OFFSET],
                     tcp_header[TCP_SEQ_OFFSET + 1],
                     tcp_header[TCP_SEQ_OFFSET + 2],
                     tcp_header[TCP_SEQ_OFFSET + 3],
                 ]);
+                let retransmitted = data.len() - rise_input.fresh_data_len;
                 seq = seq.wrapping_add(retransmitted as u32);
 
-                let new_data = &mut data[retransmitted..];
+                let fresh_data = &mut data[retransmitted..];
+                if fresh_data.len() > 0 {
+                    /* Steps:
+                     * - App -> data
+                     * - Session -> writable
+                     * - write data to writable
+                     * */
+                    let app_verdict = self
+                        .app_data_handler
+                        .on_data(session_id, is_client, seq as i64, fresh_data, rf);
 
-                let this_verdict = self
-                    .app_data_handler
-                    .on_data(session_id, is_client, seq as i64, new_data);
-                writable.copy_from_slice(new_data);
+                    if matches!(app_verdict, SnarfInterceptVerdict::Accept(..)) {
+                        let (mut writable, _) = session.rise_tcp_packet(is_client, rise_input).unwrap();
+                        writable.copy_from_slice(fresh_data);
+                    }
 
-                (rf, this_verdict)
-            } else {
-                (rf, InterceptVerdict::Accept)
-            };
+                    app_verdict
+                } else {
+                    session.rise_tcp_packet(is_client, rise_input).unwrap();
+                    SnarfInterceptVerdict::Accept(rf)
+                }
+            }
+            _ => {
+                panic!("Invalid TCP plunge result: {:?}", )
+            }
+        };
 
+        // The payload might've been modified by the tcp plunge
+        let (tcp_header, data) = tcp_payload[..].split_at_mut(header_len);
+
+        // This is done before calling transport_spy.after because transport_packet_verdict_kept
+        // and drain_futures_from_last_session also call that function.
+        // We want the order in the returned verdicts to match the order of the
+        // `after` calls.
         if remove_session {
             verdicts.append(&mut self.drain_futures_from_last_session());
             self.sessions.remove_session(src_addr, dst_addr);
@@ -650,18 +725,21 @@ where
             verdicts.append(&mut self.transport_packet_verdict_kept());
         }
 
-        let (net_header, tcp_payload) = rf.split();
-        let header_len = tcp_header_len(tcp_payload);
-        let (tcp_header, data) = tcp_payload[..].split_at(header_len);
+        let simple_vedict = this_verdict.to_intercept_verdict();
+        if let SnarfInterceptVerdict::Accept(rf) | SnarfInterceptVerdict::Drop(rf) = &mut this_verdict {
+            let (net_header, tcp_payload) = rf.split();
+            let header_len = tcp_header_len(tcp_payload);
+            let (tcp_header, data) = tcp_payload[..].split_at(header_len);
 
-        self.transport_spy.after(
-            net_header,
-            tcp_header,
-            is_client,
-            data,
-            session_id,
-            &this_verdict,
-        );
+            self.transport_spy.after(
+                net_header,
+                tcp_header,
+                is_client,
+                data,
+                session_id,
+                &this_verdict.unwrap(),
+            );
+        }
 
         if remove_session {
             self.transport_spy.close(false, session_id);
@@ -683,7 +761,7 @@ where
 
 impl<AH, TSpy, NetAddr, RF> SnarfTcp<AH, TSpy, NetAddr, RF>
 where
-    AH: ApplicationDataSnarfHandler,
+    AH: ApplicationDataSnarfHandler<RF>,
     TSpy: TransportSnarfSpy,
     NetAddr: Copy + Hash + Ord + Default,
     RF: TransportPacketParent,
@@ -788,6 +866,27 @@ where
 
         upstream_verdicts
     }
+
+    fn handle_verdict_returned_by_app_handler(&mut self, session: TcpSession<NetAddr, RF>, new_data: &[u8], verdict: SnarfInterceptVerdict<TcpRiseInputParent<NfqMessageParent>>) -> Result<SnarfInterceptVerdict<NfqMessageParent>, SnarfTcpError>
+    where
+        NetAddr: Copy + Hash + Ord + Default,
+        RF: TransportPacketParent,
+    {
+        match verdict {
+            SnarfInterceptVerdict::Accept(rf) => {
+                let (mut writable, _, ) = session.rise_tcp_packet(rf.is_client, rf.tcp_input)?;
+                vd.writable.copy_from_slice(new_data);
+                Ok(SnarfInterceptVerdict::Accept(rf.child))
+            }
+            SnarfInterceptVerdict::Drop(rf) => {
+                session.unwind(rf.is_client, rf.tcp_input);
+                Ok(SnarfInterceptVerdict::Drop(rf.child))
+            }
+            SnarfInterceptVerdict::Keep => {
+                Ok(SnarfInterceptVerdict::Keep)
+            }
+        }
+    }
 }
 
 pub type SnarfNfqIpv4Tcp<AH, NetSpy, TSpy> =
@@ -795,7 +894,7 @@ pub type SnarfNfqIpv4Tcp<AH, NetSpy, TSpy> =
 
 impl<AH, NetSpy, TSpy> SnarfNfqIpv4Tcp<AH, NetSpy, TSpy>
 where
-    AH: ApplicationDataSnarfHandler,
+    AH: ApplicationDataSnarfHandler<NfqMessageParent>,
     NetSpy: NetworkSnarfSpy,
     TSpy: TransportSnarfSpy,
 {
@@ -814,7 +913,7 @@ where
 
 impl<AH, NetSpy, TSpy> SnarfNfqIpv4Tcp<AH, NetSpy, TSpy>
 where
-    AH: ApplicationDataSnarfHandler + Default,
+    AH: ApplicationDataSnarfHandler<NfqMessageParent> + Default,
     NetSpy: NetworkSnarfSpy + Default,
     TSpy: TransportSnarfSpy + Default,
 {
@@ -843,7 +942,7 @@ impl SnarfNfqIpv4TcpOptions {
         &self,
     ) -> Result<SnarfNfqIpv4Tcp<AH, NetSpy, TSpy>, Box<dyn Error>>
     where
-        AH: ApplicationDataSnarfHandler + Default,
+        AH: ApplicationDataSnarfHandler<NfqMessageParent> + Default,
         NetSpy: NetworkSnarfSpy + Default,
         TSpy: TransportSnarfSpy + Default,
     {
@@ -857,7 +956,7 @@ impl SnarfNfqIpv4TcpOptions {
         transport_spy: TSpy,
     ) -> Result<SnarfNfqIpv4Tcp<AH, NetSpy, TSpy>, Box<dyn Error>>
     where
-        AH: ApplicationDataSnarfHandler,
+        AH: ApplicationDataSnarfHandler<NfqMessageParent>,
         NetSpy: NetworkSnarfSpy,
         TSpy: TransportSnarfSpy,
     {
@@ -878,7 +977,7 @@ mod test_snarf_tcp {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct AHDummy {}
-    impl ApplicationDataSnarfHandler for AHDummy {
+    impl<RF> ApplicationDataSnarfHandler<RF> for AHDummy {
         fn on_data(
             &mut self,
             _session_id: u64,
@@ -886,7 +985,7 @@ mod test_snarf_tcp {
             _counter: i64,
             _data: &mut [u8],
         ) -> InterceptVerdict {
-            InterceptVerdict::Accept
+            SnarfInterceptVerdict::Accept
         }
     }
 
