@@ -124,11 +124,12 @@ where
     }
 }
 
-/// (Retramsitted, Write buffer, Retransmission copy, Closing, NewConnection)
+/// (Retramsitted, Write buffer, Retransmission copy, Future, Closing, NewConnection)
 pub type TcpTrackerUpdateResult<'a> = (
     usize,
     Option<DequeSliceMut<'a, u8>>,
     Option<DequeSlice<'a, u8>>,
+    bool,
     bool,
     bool,
 );
@@ -227,28 +228,22 @@ where
             self.fin = false;
             self.closed = false;
 
-            return Ok((0, None, None, false, new_connection));
+            return Ok((0, None, None, false, false, new_connection));
         } else if self.closed {
-            return Ok((0, None, None, false, false));
+            return Ok((0, None, None, false, false, false));
         } else if (flags & RST_MASK) != 0 {
             self.closed = true;
-            return Ok((0, None, None, true, false));
+            return Ok((0, None, None, false, true, false));
         } else if !self.first_seq {
             // The connection has not encountered SYN yet so we consider all packets to be future
-            return Ok((0, None, None, false, false));
+            return Ok((0, None, None, false, false, false));
         }
 
         let next_seq = next_seq as i64;
 
-        if data_len == 0 && (flags & FIN_MASK) != 0 {
-            self.fin = true;
-            self.buffer.update(1);
-            return Ok((data_len as usize, None, None, false, false));
-        }
-
         // 1 <= X2 - E <= window_len, otherwise it's old data or outside the window
         let new_data_len = (next_seq + data_len - curr_seq) % SEQ_LIM;
-        if !(1..=buffer_len).contains(&new_data_len) {
+        if !(0..=buffer_len).contains(&new_data_len) {
             let right_offset = (SEQ_LIM - new_data_len) % SEQ_LIM;
             if !(0..buffer_len).contains(&right_offset) {
                 return Err(PacketOutsideWindow);
@@ -261,13 +256,13 @@ where
             self.buffer
                 .write_from_buffer_to_slice(data, next_seq as u32);
 
-            return Ok((data_len as usize, None, None, false, false));
+            return Ok((data_len as usize, None, None, false, false, false));
         }
 
         // X1 <= E, otherwise it's future
         let old_data_len = data_len - new_data_len;
         if !(0..=buffer_len).contains(&old_data_len) {
-            return Ok((0, None, None, false, false));
+            return Ok((0, None, None, true, false, false));
         }
 
         if old_data_len > 0 {
@@ -278,6 +273,11 @@ where
         let mut increase_data_len = new_data_len;
         if (flags & FIN_MASK) != 0 {
             self.fin = true;
+            if new_data_len == 0 {
+                self.buffer.update(1);
+                return Ok((0, None, None, true, false, false));
+            }
+
             increase_data_len += 1;
         }
 
@@ -296,6 +296,7 @@ where
             old_data_len as usize,
             Some(write_space),
             Some(remaining_space.to_immutable()),
+            false,
             false,
             false,
         ))
@@ -456,6 +457,7 @@ pub type TcpParseResult<'a> = (
     Option<DequeSlice<'a, u8>>,
     bool,
     bool,
+    bool,
 );
 
 #[derive(Debug)]
@@ -518,7 +520,7 @@ where
 
         if self.src_net == src_net && self.src_port == src_port {
             is_client = true;
-            let (retransmitted, writable, remaining, closing, new_connection) =
+            let (retransmitted, writable, remaining, is_future, closing, new_connection) =
                 self.src_tracker.update(flags, seq, data)?;
 
             Ok((
@@ -526,12 +528,13 @@ where
                 retransmitted,
                 writable,
                 remaining,
+                is_future,
                 closing,
                 new_connection,
             ))
         } else {
             is_client = false;
-            let (retransmitted, writable, remaining, closing, new_connection) =
+            let (retransmitted, writable, remaining, is_future, closing, new_connection) =
                 self.dst_tracker.update(flags, seq, data)?;
 
             Ok((
@@ -539,6 +542,7 @@ where
                 retransmitted,
                 writable,
                 remaining,
+                is_future,
                 closing,
                 new_connection,
             ))
@@ -590,12 +594,13 @@ mod helpers_test_tcp_peer_tracker {
         ) -> Result<(usize, usize, Vec<u8>)> {
             const DUMMY_HEADER_LEN: usize = 21;
             let mut buf = data.to_vec();
-            let (retransmitted, writable, _, _, _) = self.update(flags, next_seq, &mut buf)?;
+            let (retransmitted, writable, _, is_future, _, _) =
+                self.update(flags, next_seq, &mut buf)?;
 
             if let Some(mut writable) = writable {
                 writable.copy_from_slice(&data[retransmitted..]);
                 return Ok((retransmitted, data.len() - retransmitted, buf));
-            } else if retransmitted == 0 && !data.is_empty() {
+            } else if is_future {
                 let packet = FuturePacket::new(next_seq, DUMMY_HEADER_LEN, buf.clone());
                 self.add_future_packet(packet);
             }
@@ -611,7 +616,8 @@ mod helpers_test_tcp_peer_tracker {
         ) -> Result<usize> {
             const DUMMY_HEADER_LEN: usize = 21;
             let mut buf = data.to_vec();
-            let (retransmitted, writable, _, _, _) = self.update(flags, next_seq, &mut buf)?;
+            let (retransmitted, writable, _, is_future, _, _) =
+                self.update(flags, next_seq, &mut buf)?;
 
             assert!(retransmitted == 0);
             assert!(buf == data);
@@ -619,7 +625,7 @@ mod helpers_test_tcp_peer_tracker {
             if let Some(mut writable) = writable {
                 writable.copy_from_slice(&data[retransmitted..]);
                 return Ok(data.len() - retransmitted);
-            } else if retransmitted == 0 && !data.is_empty() {
+            } else if is_future {
                 let mut tcp_payload = vec![0u8; DUMMY_HEADER_LEN];
                 tcp_payload[TCP_FLAGS_IDX] = flags;
                 tcp_payload.extend_from_slice(&buf);
@@ -2138,7 +2144,7 @@ mod test_tcp_peer_tracker_state {
 
         assert!(!t.fin);
 
-        // Missing byte
+        // Missing byte before the FIN
         let data3 = pseudorandom_data(1);
         let written = t.update_and_copy_assume_new(0, 25, &data3).unwrap();
         assert_eq!(written, 1);
@@ -2160,6 +2166,46 @@ mod test_tcp_peer_tracker_state {
         dbg!(&data1);
         dbg!(&data2);
         let expected: Vec<u8> = data1.into_iter().chain(data3).chain(data2).collect();
+        let mut data = vec![0; expected.len()];
+        t.buffer.write_from_buffer_to_slice(&mut data, 21);
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn test_fin_empty_future() {
+        let mut t = tcp_peer_tracker();
+        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+
+        // First segment
+        let data1 = pseudorandom_data(4);
+        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        assert_eq!(written, data1.len());
+
+        // Empty FIN that is future
+        let written = t.update_and_copy_assume_new(FIN_MASK, 26, &[]).unwrap();
+        assert_eq!(written, 0);
+
+        assert!(!t.fin);
+
+        // Missing byte before the FIN
+        let data3 = pseudorandom_data(1);
+        let written = t.update_and_copy_assume_new(0, 25, &data3).unwrap();
+        assert_eq!(written, 1);
+
+        assert!(!t.fin);
+
+        let verdicts = t.update_future_queue();
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].new_data_len, 0);
+
+        assert!(t.fin);
+
+        // Final ACK
+        let written = t.update_and_copy_assume_new(0, 31, &[]).unwrap();
+        assert_eq!(written, 0);
+
+        // Test that the ringbuffer hasn't broken after the FIN packet has increased the SEQ
+        let expected: Vec<u8> = data1.into_iter().chain(data3).collect();
         let mut data = vec![0; expected.len()];
         t.buffer.write_from_buffer_to_slice(&mut data, 21);
         assert_eq!(data, expected);
