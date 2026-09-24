@@ -583,10 +583,17 @@ where
         self.transport_spy
             .before(net_header, tcp_header, data, session_id);
 
-        let (mut is_client, mut retransmitted, mut writable, _, mut closing, new_connection) =
-            session
-                .read_tcp_packet(src_net, src_port, tcp_payload)
-                .unwrap();
+        let (
+            mut is_client,
+            mut retransmitted,
+            mut writable,
+            _,
+            mut is_future,
+            mut closing,
+            new_connection,
+        ) = session
+            .read_tcp_packet(src_net, src_port, tcp_payload)
+            .unwrap();
 
         if new_connection {
             verdicts.append(&mut self.drain_futures_from_last_session());
@@ -596,7 +603,7 @@ where
             session = &mut result.session;
             session_id = result.session_id;
 
-            (is_client, retransmitted, writable, _, closing, _) = session
+            (is_client, retransmitted, writable, _, is_future, closing, _) = session
                 .read_tcp_packet(src_net, src_port, tcp_payload)
                 .unwrap();
         };
@@ -606,9 +613,9 @@ where
         let (tcp_header, data) = tcp_payload[..].split_at_mut(header_len);
 
         let mut remove_session = closing;
-        // If packet is from future
         let (mut rf, this_verdict) =
-            if writable.is_none() && retransmitted == 0 && !data.is_empty() && !closing {
+            // If packet is from future
+            if is_future {
                 let res = session.add_future_payload(is_client, rf);
                 match res {
                     Err((rf, SnarfTcpError::FutureQueueOverflow)) => {
