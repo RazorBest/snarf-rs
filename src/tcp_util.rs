@@ -22,16 +22,6 @@ pub fn tcp_header_len(tcp_payload: &[u8]) -> usize {
 }
 
 #[inline(always)]
-pub fn tcp_seq(tcp_payload: &[u8]) -> u32 {
-    u32::from_be_bytes([
-        tcp_payload[TCP_SEQ_OFFSET],
-        tcp_payload[TCP_SEQ_OFFSET + 1],
-        tcp_payload[TCP_SEQ_OFFSET + 2],
-        tcp_payload[TCP_SEQ_OFFSET + 3],
-    ])
-}
-
-#[inline(always)]
 pub fn tcp_src_port(tcp_payload: &[u8]) -> u16 {
     u16::from_be_bytes([
         tcp_payload[TCP_SRCPORT_OFFSET],
@@ -44,6 +34,16 @@ pub fn tcp_dst_port(tcp_payload: &[u8]) -> u16 {
     u16::from_be_bytes([
         tcp_payload[TCP_DSTPORT_OFFSET],
         tcp_payload[TCP_DSTPORT_OFFSET + 1],
+    ])
+}
+
+#[inline(always)]
+pub fn tcp_seq(tcp_payload: &[u8]) -> u32 {
+    u32::from_be_bytes([
+        tcp_payload[TCP_SEQ_OFFSET],
+        tcp_payload[TCP_SEQ_OFFSET + 1],
+        tcp_payload[TCP_SEQ_OFFSET + 2],
+        tcp_payload[TCP_SEQ_OFFSET + 3],
     ])
 }
 
