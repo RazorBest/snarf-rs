@@ -124,11 +124,12 @@ where
     }
 }
 
-/// (Retramsitted, Write buffer, Retransmission copy, Future, Closing, NewConnection)
+/// (Retramsitted, Write buffer, Retransmission copy, Future, Closing, NewConnection, Fin)
 pub type TcpTrackerUpdateResult<'a> = (
     usize,
     Option<DequeSliceMut<'a, u8>>,
     Option<DequeSlice<'a, u8>>,
+    bool,
     bool,
     bool,
     bool,
@@ -228,15 +229,15 @@ where
             self.fin = false;
             self.closed = false;
 
-            return Ok((0, None, None, false, false, new_connection));
+            return Ok((0, None, None, false, false, new_connection, self.fin));
         } else if self.closed {
-            return Ok((0, None, None, false, false, false));
+            return Ok((0, None, None, false, false, false, self.fin));
         } else if (flags & RST_MASK) != 0 {
             self.closed = true;
-            return Ok((0, None, None, false, true, false));
+            return Ok((0, None, None, false, true, false, self.fin));
         } else if !self.first_seq {
             // The connection has not encountered SYN yet so we consider all packets to be future
-            return Ok((0, None, None, false, false, false));
+            return Ok((0, None, None, false, false, false, self.fin));
         }
 
         let next_seq = next_seq as i64;
@@ -256,13 +257,21 @@ where
             self.buffer
                 .write_from_buffer_to_slice(data, next_seq as u32);
 
-            return Ok((data_len as usize, None, None, false, false, false));
+            return Ok((
+                data_len as usize,
+                None,
+                None,
+                false,
+                false,
+                false,
+                self.fin,
+            ));
         }
 
         // X1 <= E, otherwise it's future
         let old_data_len = data_len - new_data_len;
         if !(0..=buffer_len).contains(&old_data_len) {
-            return Ok((0, None, None, true, false, false));
+            return Ok((0, None, None, true, false, false, self.fin));
         }
 
         if old_data_len > 0 {
@@ -275,7 +284,7 @@ where
             self.fin = true;
             if new_data_len == 0 {
                 self.buffer.update(1);
-                return Ok((0, None, None, true, false, false));
+                return Ok((0, None, None, false, false, false, self.fin));
             }
 
             increase_data_len += 1;
@@ -299,6 +308,7 @@ where
             false,
             false,
             false,
+            self.fin,
         ))
     }
 
@@ -520,8 +530,19 @@ where
 
         if self.src_net == src_net && self.src_port == src_port {
             is_client = true;
-            let (retransmitted, writable, remaining, is_future, closing, new_connection) =
-                self.src_tracker.update(flags, seq, data)?;
+            let (
+                retransmitted,
+                writable,
+                remaining,
+                is_future,
+                mut closing,
+                new_connection,
+                is_fin,
+            ) = self.src_tracker.update(flags, seq, data)?;
+
+            if is_fin && self.dst_tracker.fin {
+                closing = true;
+            }
 
             Ok((
                 is_client,
@@ -534,8 +555,19 @@ where
             ))
         } else {
             is_client = false;
-            let (retransmitted, writable, remaining, is_future, closing, new_connection) =
-                self.dst_tracker.update(flags, seq, data)?;
+            let (
+                retransmitted,
+                writable,
+                remaining,
+                is_future,
+                mut closing,
+                new_connection,
+                is_fin,
+            ) = self.dst_tracker.update(flags, seq, data)?;
+
+            if is_fin && self.src_tracker.fin {
+                closing = true;
+            }
 
             Ok((
                 is_client,
@@ -579,6 +611,10 @@ where
             self.dst_tracker.drain_nowrite_future_queue()
         }
     }
+
+    pub fn is_fin(&self) -> bool {
+        self.src_tracker.fin && self.dst_tracker.fin
+    }
 }
 
 #[cfg(test)]
@@ -594,7 +630,7 @@ mod helpers_test_tcp_peer_tracker {
         ) -> Result<(usize, usize, Vec<u8>)> {
             const DUMMY_HEADER_LEN: usize = 21;
             let mut buf = data.to_vec();
-            let (retransmitted, writable, _, is_future, _, _) =
+            let (retransmitted, writable, _, is_future, _, _, _) =
                 self.update(flags, next_seq, &mut buf)?;
 
             if let Some(mut writable) = writable {
@@ -616,7 +652,7 @@ mod helpers_test_tcp_peer_tracker {
         ) -> Result<usize> {
             const DUMMY_HEADER_LEN: usize = 21;
             let mut buf = data.to_vec();
-            let (retransmitted, writable, _, is_future, _, _) =
+            let (retransmitted, writable, _, is_future, _, _, _) =
                 self.update(flags, next_seq, &mut buf)?;
 
             assert!(retransmitted == 0);
