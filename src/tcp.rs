@@ -14,8 +14,8 @@ use crate::util::CircularSeqBuffer;
 
 pub const SEQ_LIM: i64 = u32::MAX as i64 + 1;
 
-const BUFFER_SIZE: usize = 65535 * 16;
-const MAX_FUTURE_SIZE: usize = 65535 * 16;
+const BUFFER_SIZE: usize = 65535 * 32;
+const MAX_FUTURE_SIZE: usize = 65535 * 32;
 
 #[derive(Debug, Clone)]
 pub enum SnarfTcpError {
