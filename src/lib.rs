@@ -63,6 +63,8 @@ pub trait ApplicationDataSnarfHandler {
         counter: i64,
         data: &mut [u8],
     ) -> InterceptVerdict;
+
+    fn close(&mut self, session_id: u64, is_client: bool);
 }
 
 #[derive(Default)]
@@ -682,7 +684,9 @@ where
 
         if remove_session {
             self.transport_spy.close(false, session_id);
+            self.app_data_handler.close(session_id, false);
             self.transport_spy.close(true, session_id);
+            self.app_data_handler.close(session_id, true);
         }
 
         match this_verdict {
