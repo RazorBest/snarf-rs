@@ -63,6 +63,8 @@ pub trait ApplicationDataSnarfHandler {
         counter: i64,
         data: &mut [u8],
     ) -> InterceptVerdict;
+
+    fn close(&mut self, session_id: u64, is_client: bool);
 }
 
 #[derive(Default)]
@@ -650,11 +652,21 @@ where
                 (rf, InterceptVerdict::Accept)
             };
 
+        if !remove_session {
+            verdicts.append(&mut self.transport_packet_verdict_kept());
+
+            let res =
+                Self::get_last_accessed_session(self.last_used_key, &mut self.sessions).unwrap();
+            let session = &mut res.session;
+
+            if session.is_fin() {
+                remove_session = true;
+            }
+        }
+
         if remove_session {
             verdicts.append(&mut self.drain_futures_from_last_session());
             self.sessions.remove_session(src_addr, dst_addr);
-        } else {
-            verdicts.append(&mut self.transport_packet_verdict_kept());
         }
 
         let (net_header, tcp_payload) = rf.split();
@@ -672,7 +684,9 @@ where
 
         if remove_session {
             self.transport_spy.close(false, session_id);
+            self.app_data_handler.close(session_id, false);
             self.transport_spy.close(true, session_id);
+            self.app_data_handler.close(session_id, true);
         }
 
         match this_verdict {

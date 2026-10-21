@@ -8,20 +8,22 @@ use std::time::Instant;
 use crate::TransportPacketParent;
 use crate::deque::{DequeSlice, DequeSliceMut};
 use crate::tcp_util::{
-    FIN_MASK, RST_MASK, SYN_MASK, TCP_FLAGS_IDX, tcp_fin, tcp_header_len, tcp_seq,
+    FIN_MASK, RST_MASK, SYN_MASK, TCP_FLAGS_IDX, tcp_ack, tcp_fin, tcp_header_len, tcp_seq,
 };
 use crate::util::CircularSeqBuffer;
 
 pub const SEQ_LIM: i64 = u32::MAX as i64 + 1;
 
-const BUFFER_SIZE: usize = 65535 * 16;
-const MAX_FUTURE_SIZE: usize = 65535 * 16;
+const BUFFER_SIZE: usize = 65535 * 32;
+const MAX_FUTURE_SIZE: usize = 65535 * 32;
 
 #[derive(Debug, Clone)]
 pub enum SnarfTcpError {
     PacketTooBigError,
     PacketOutsideWindow,
     FutureQueueOverflow,
+    AckNotFoundInSyn,
+    InvalidAckInSyn,
 }
 use SnarfTcpError::*;
 
@@ -124,7 +126,7 @@ where
     }
 }
 
-/// (Retramsitted, Write buffer, Retransmission copy, Future, Closing, NewConnection)
+/// (Retramsitted, Write buffer, Retransmission copy, Future, Closing, NewConnection, Fin)
 pub type TcpTrackerUpdateResult<'a> = (
     usize,
     Option<DequeSliceMut<'a, u8>>,
@@ -132,16 +134,64 @@ pub type TcpTrackerUpdateResult<'a> = (
     bool,
     bool,
     bool,
+    bool,
 );
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TcpPeerState {
+    SessionInit,
+    SynSent(u32),
+    Established,
+    SessionFin,
+    SessionClosed,
+}
+
+impl TcpPeerState {
+    pub fn new() -> Self {
+        Self::SessionInit
+    }
+
+    pub fn is_init(&self) -> bool {
+        return matches!(self, Self::SessionInit);
+    }
+
+    pub fn is_established(&self) -> bool {
+        return matches!(self, Self::Established);
+    }
+
+    pub fn is_fin(&self) -> bool {
+        return matches!(self, Self::SessionFin);
+    }
+
+    pub fn is_closed(&self) -> bool {
+        return matches!(self, Self::SessionClosed);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TcpPeerRecvState {
+    RecvInit,
+    RecvSynSeq(u32),
+    RecvDone,
+}
+
+impl TcpPeerRecvState {
+    pub fn new() -> Self {
+        Self::RecvInit
+    }
+
+    pub fn is_init(&self) -> bool {
+        return matches!(self, Self::RecvInit);
+    }
+}
 
 #[derive(Debug)]
 pub struct TcpPeerTracker<RF>
 where
     RF: TransportPacketParent,
 {
-    pub first_seq: bool,
-    pub fin: bool,
-    pub closed: bool,
+    pub state: TcpPeerState,
+    pub recv_state: TcpPeerRecvState,
 
     pub buffer: CircularSeqBuffer,
     pub future: Vec<FuturePacket<RF>>,
@@ -154,11 +204,10 @@ where
 {
     pub fn new() -> Self {
         Self {
-            first_seq: false,
-            fin: false,
-            closed: false,
+            state: TcpPeerState::new(),
+            recv_state: TcpPeerRecvState::new(),
 
-            buffer: CircularSeqBuffer::new(BUFFER_SIZE),
+            buffer: CircularSeqBuffer::new(2),
             future: vec![],
             future_size: 0,
         }
@@ -178,8 +227,11 @@ where
         &'a mut self,
         flags: u8,
         next_seq: u32,
+        ack: Option<u32>,
         data: &mut [u8],
     ) -> Result<TcpTrackerUpdateResult<'a>> {
+        use TcpPeerRecvState::*;
+        use TcpPeerState::*;
         /*
          * S = seq of the first byte still available in the window
          * E = self.buffer.seq = seq of the first byte outside the window
@@ -214,29 +266,45 @@ where
         let data_len = data.len() as i64;
         let curr_seq = self.buffer.seq as i64;
 
-        // X2 - X1 <= widow_len
-        if data_len > buffer_len {
-            return Err(PacketTooBigError);
-        }
+        if (flags & SYN_MASK) != 0 && (!self.state.is_established()) {
+            if let RecvSynSeq(recv_syn_seq) = self.recv_state.clone() {
+                let Some(ack_num) = ack else {
+                    return Err(AckNotFoundInSyn);
+                };
 
-        if (flags & SYN_MASK) != 0 && (!self.first_seq || self.fin || self.closed) {
-            let new_connection = self.fin || self.closed;
+                if ack_num != recv_syn_seq.wrapping_add(1) {
+                    return Err(InvalidAckInSyn);
+                }
+
+                self.recv_state = RecvDone;
+            }
+
+            let new_connection = self.state.is_fin() || self.state.is_closed();
+            self.state = SynSent(next_seq);
             self.buffer.fill_zero();
             self.buffer.seq = next_seq;
             self.buffer.seq_add(1);
-            self.first_seq = true;
-            self.fin = false;
-            self.closed = false;
 
-            return Ok((0, None, None, false, false, new_connection));
-        } else if self.closed {
-            return Ok((0, None, None, false, false, false));
-        } else if (flags & RST_MASK) != 0 {
-            self.closed = true;
-            return Ok((0, None, None, false, true, false));
-        } else if !self.first_seq {
-            // The connection has not encountered SYN yet so we consider all packets to be future
-            return Ok((0, None, None, false, false, false));
+            return Ok((0, None, None, false, false, new_connection, self.is_fin()));
+        }
+
+        if self.state.is_closed() {
+            return Ok((0, None, None, false, false, false, self.is_fin()));
+        }
+
+        if (flags & RST_MASK) != 0 {
+            self.state = SessionClosed;
+            self.recv_state = RecvInit;
+            return Ok((0, None, None, false, true, false, self.is_fin()));
+        }
+
+        if !self.state.is_established() {
+            return Ok((0, None, None, false, false, false, self.is_fin()));
+        }
+
+        // X2 - X1 <= widow_len
+        if data_len > buffer_len {
+            return Err(PacketTooBigError);
         }
 
         let next_seq = next_seq as i64;
@@ -256,13 +324,21 @@ where
             self.buffer
                 .write_from_buffer_to_slice(data, next_seq as u32);
 
-            return Ok((data_len as usize, None, None, false, false, false));
+            return Ok((
+                data_len as usize,
+                None,
+                None,
+                false,
+                false,
+                false,
+                self.is_fin(),
+            ));
         }
 
         // X1 <= E, otherwise it's future
         let old_data_len = data_len - new_data_len;
         if !(0..=buffer_len).contains(&old_data_len) {
-            return Ok((0, None, None, true, false, false));
+            return Ok((0, None, None, true, false, false, self.is_fin()));
         }
 
         if old_data_len > 0 {
@@ -272,10 +348,11 @@ where
 
         let mut increase_data_len = new_data_len;
         if (flags & FIN_MASK) != 0 {
-            self.fin = true;
+            self.state = SessionFin;
+            self.recv_state = RecvInit;
             if new_data_len == 0 {
                 self.buffer.update(1);
-                return Ok((0, None, None, true, false, false));
+                return Ok((0, None, None, false, false, false, self.is_fin()));
             }
 
             increase_data_len += 1;
@@ -299,7 +376,40 @@ where
             false,
             false,
             false,
+            self.state.is_fin(),
         ))
+    }
+
+    pub fn update_recv_syn(&mut self, seq: u32) {
+        use TcpPeerRecvState::*;
+
+        match self.recv_state.clone() {
+            RecvInit | RecvSynSeq(..) => {
+                self.recv_state = TcpPeerRecvState::RecvSynSeq(seq);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn update_recv_ack(&mut self, ack_number: u32) {
+        let TcpPeerState::SynSent(syn_sent) = self.state else {
+            return;
+        };
+
+        if ack_number == syn_sent.wrapping_add(1) {
+            self.state = TcpPeerState::Established;
+            self.buffer = CircularSeqBuffer::new(BUFFER_SIZE);
+            self.buffer.fill_zero();
+            self.buffer.seq = syn_sent;
+            self.buffer.seq_add(1);
+        } else {
+            use tracing::debug;
+            debug!(
+                "Received ack {}. Expecting {}",
+                ack_number,
+                syn_sent.wrapping_add(1)
+            );
+        }
     }
 
     /// Pulls packets from the future queue, if they are not futures anymore.
@@ -308,7 +418,10 @@ where
     /// expected SEQ for the peer. Future packets can be pulled from the queue
     /// after an `update` call that provides the missing bytes before the future.
     pub fn update_future_queue<'a>(&'a mut self) -> Vec<FutureVerdict<'a, RF>> {
-        if !self.first_seq {
+        use TcpPeerRecvState::*;
+        use TcpPeerState::*;
+
+        if self.state.is_init() {
             return vec![];
         }
 
@@ -351,7 +464,8 @@ where
             let is_fin = tcp_fin(tcp_payload);
             if is_fin {
                 self.buffer.update(1);
-                self.fin = true;
+                self.state = SessionFin;
+                self.recv_state = RecvInit;
             }
 
             let verdict = (packet, new_data_len as usize, is_fin);
@@ -439,6 +553,10 @@ where
 
         (first, second)
     }
+
+    pub fn is_fin(&self) -> bool {
+        self.state.is_fin()
+    }
 }
 
 impl<RF> Default for TcpPeerTracker<RF>
@@ -511,6 +629,7 @@ where
         }
 
         let seq = tcp_seq(tcp_payload);
+        let maybe_ack = tcp_ack(tcp_payload);
         let flags = tcp_payload[TCP_FLAGS_IDX];
         let header_len = tcp_header_len(tcp_payload);
 
@@ -520,8 +639,26 @@ where
 
         if self.src_net == src_net && self.src_port == src_port {
             is_client = true;
-            let (retransmitted, writable, remaining, is_future, closing, new_connection) =
-                self.src_tracker.update(flags, seq, data)?;
+            let (
+                retransmitted,
+                writable,
+                remaining,
+                is_future,
+                mut closing,
+                new_connection,
+                is_fin,
+            ) = self.src_tracker.update(flags, seq, maybe_ack, data)?;
+
+            if is_fin && self.dst_tracker.is_fin() {
+                closing = true;
+            }
+
+            if !is_future {
+                self.dst_tracker.update_recv_syn(seq);
+                if let Some(ack_number) = maybe_ack {
+                    self.dst_tracker.update_recv_ack(ack_number);
+                }
+            }
 
             Ok((
                 is_client,
@@ -534,8 +671,26 @@ where
             ))
         } else {
             is_client = false;
-            let (retransmitted, writable, remaining, is_future, closing, new_connection) =
-                self.dst_tracker.update(flags, seq, data)?;
+            let (
+                retransmitted,
+                writable,
+                remaining,
+                is_future,
+                mut closing,
+                new_connection,
+                is_fin,
+            ) = self.dst_tracker.update(flags, seq, maybe_ack, data)?;
+
+            if is_fin && self.src_tracker.is_fin() {
+                closing = true;
+            }
+
+            if !is_future {
+                self.src_tracker.update_recv_syn(seq);
+                if let Some(ack_number) = maybe_ack {
+                    self.src_tracker.update_recv_ack(ack_number);
+                }
+            }
 
             Ok((
                 is_client,
@@ -579,6 +734,10 @@ where
             self.dst_tracker.drain_nowrite_future_queue()
         }
     }
+
+    pub fn is_fin(&self) -> bool {
+        self.src_tracker.is_fin() && self.dst_tracker.is_fin()
+    }
 }
 
 #[cfg(test)]
@@ -594,7 +753,7 @@ mod helpers_test_tcp_peer_tracker {
         ) -> Result<(usize, usize, Vec<u8>)> {
             const DUMMY_HEADER_LEN: usize = 21;
             let mut buf = data.to_vec();
-            let (retransmitted, writable, _, is_future, _, _) =
+            let (retransmitted, writable, _, is_future, _, _, _) =
                 self.update(flags, next_seq, &mut buf)?;
 
             if let Some(mut writable) = writable {
@@ -616,7 +775,7 @@ mod helpers_test_tcp_peer_tracker {
         ) -> Result<usize> {
             const DUMMY_HEADER_LEN: usize = 21;
             let mut buf = data.to_vec();
-            let (retransmitted, writable, _, is_future, _, _) =
+            let (retransmitted, writable, _, is_future, _, _, _) =
                 self.update(flags, next_seq, &mut buf)?;
 
             assert!(retransmitted == 0);
