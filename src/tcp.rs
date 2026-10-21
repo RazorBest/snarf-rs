@@ -135,14 +135,43 @@ pub type TcpTrackerUpdateResult<'a> = (
     bool,
 );
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum TcpPeerState {
+    SessionInit,
+    SynSent(u32),
+    Established,
+    SessionFin,
+    SessionClosed,
+}
+
+impl TcpPeerState {
+    pub fn new() -> Self {
+        Self::SessionInit
+    }
+
+    pub fn is_init(&self) -> bool {
+        return matches!(self, Self::SessionInit);
+    }
+
+    pub fn is_established(&self) -> bool {
+        return matches!(self, Self::Established);
+    }
+
+    pub fn is_fin(&self) -> bool {
+        return matches!(self, Self::SessionFin);
+    }
+
+    pub fn is_closed(&self) -> bool {
+        return matches!(self, Self::SessionClosed);
+    }
+}
+
 #[derive(Debug)]
 pub struct TcpPeerTracker<RF>
 where
     RF: TransportPacketParent,
 {
-    pub first_seq: bool,
-    pub fin: bool,
-    pub closed: bool,
+    pub state: TcpPeerState,
 
     pub buffer: CircularSeqBuffer,
     pub future: Vec<FuturePacket<RF>>,
@@ -155,9 +184,7 @@ where
 {
     pub fn new() -> Self {
         Self {
-            first_seq: false,
-            fin: false,
-            closed: false,
+            state: TcpPeerState::new(),
 
             buffer: CircularSeqBuffer::new(BUFFER_SIZE),
             future: vec![],
@@ -181,6 +208,7 @@ where
         next_seq: u32,
         data: &mut [u8],
     ) -> Result<TcpTrackerUpdateResult<'a>> {
+        use TcpPeerState::*;
         /*
          * S = seq of the first byte still available in the window
          * E = self.buffer.seq = seq of the first byte outside the window
@@ -219,25 +247,23 @@ where
         if data_len > buffer_len {
             return Err(PacketTooBigError);
         }
+        if (flags & SYN_MASK) != 0 && (!self.state.is_established()) {
 
-        if (flags & SYN_MASK) != 0 && (!self.first_seq || self.fin || self.closed) {
-            let new_connection = self.fin || self.closed;
+            let new_connection = self.state.is_fin() || self.state.is_closed();
+            self.state = SynSent(next_seq);
             self.buffer.fill_zero();
             self.buffer.seq = next_seq;
             self.buffer.seq_add(1);
-            self.first_seq = true;
-            self.fin = false;
-            self.closed = false;
-
-            return Ok((0, None, None, false, false, new_connection, self.fin));
-        } else if self.closed {
-            return Ok((0, None, None, false, false, false, self.fin));
+            return Ok((0, None, None, false, false, new_connection, self.is_fin()));
+        } else if self.is_closed() {
+            return Ok((0, None, None, false, false, false, self.is_fin()));
         } else if (flags & RST_MASK) != 0 {
-            self.closed = true;
-            return Ok((0, None, None, false, true, false, self.fin));
-        } else if !self.first_seq {
-            // The connection has not encountered SYN yet so we consider all packets to be future
-            return Ok((0, None, None, false, false, false, self.fin));
+            self.state = SessionClosed;
+            return Ok((0, None, None, false, true, false, self.is_fin()));
+        }
+
+        if !self.state.is_established() {
+            return Ok((0, None, None, false, false, false, self.is_fin()));
         }
 
         let next_seq = next_seq as i64;
@@ -264,14 +290,14 @@ where
                 false,
                 false,
                 false,
-                self.fin,
+                self.is_fin(),
             ));
         }
 
         // X1 <= E, otherwise it's future
         let old_data_len = data_len - new_data_len;
         if !(0..=buffer_len).contains(&old_data_len) {
-            return Ok((0, None, None, true, false, false, self.fin));
+            return Ok((0, None, None, true, false, false, self.is_fin()));
         }
 
         if old_data_len > 0 {
@@ -281,10 +307,10 @@ where
 
         let mut increase_data_len = new_data_len;
         if (flags & FIN_MASK) != 0 {
-            self.fin = true;
+            self.state = SessionFin;
             if new_data_len == 0 {
                 self.buffer.update(1);
-                return Ok((0, None, None, false, false, false, self.fin));
+                return Ok((0, None, None, false, false, false, self.is_fin()));
             }
 
             increase_data_len += 1;
@@ -308,7 +334,7 @@ where
             false,
             false,
             false,
-            self.fin,
+            self.state.is_fin(),
         ))
     }
 
@@ -318,7 +344,9 @@ where
     /// expected SEQ for the peer. Future packets can be pulled from the queue
     /// after an `update` call that provides the missing bytes before the future.
     pub fn update_future_queue<'a>(&'a mut self) -> Vec<FutureVerdict<'a, RF>> {
-        if !self.first_seq {
+        use TcpPeerState::*;
+
+        if self.state.is_init() {
             return vec![];
         }
 
@@ -361,7 +389,7 @@ where
             let is_fin = tcp_fin(tcp_payload);
             if is_fin {
                 self.buffer.update(1);
-                self.fin = true;
+                self.state = SessionFin;
             }
 
             let verdict = (packet, new_data_len as usize, is_fin);
@@ -448,6 +476,10 @@ where
         let first = &half2[start2..];
 
         (first, second)
+    }
+
+    pub fn is_fin(&self) -> bool {
+        self.state.is_fin()
     }
 }
 
@@ -540,7 +572,7 @@ where
                 is_fin,
             ) = self.src_tracker.update(flags, seq, data)?;
 
-            if is_fin && self.dst_tracker.fin {
+            if is_fin && self.dst_tracker.is_fin() {
                 closing = true;
             }
 
@@ -565,7 +597,7 @@ where
                 is_fin,
             ) = self.dst_tracker.update(flags, seq, data)?;
 
-            if is_fin && self.src_tracker.fin {
+            if is_fin && self.src_tracker.is_fin() {
                 closing = true;
             }
 
@@ -613,7 +645,7 @@ where
     }
 
     pub fn is_fin(&self) -> bool {
-        self.src_tracker.fin && self.dst_tracker.fin
+        self.src_tracker.is_fin() && self.dst_tracker.is_fin()
     }
 }
 
