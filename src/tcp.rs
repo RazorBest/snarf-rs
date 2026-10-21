@@ -186,7 +186,7 @@ where
         Self {
             state: TcpPeerState::new(),
 
-            buffer: CircularSeqBuffer::new(BUFFER_SIZE),
+            buffer: CircularSeqBuffer::new(2),
             future: vec![],
             future_size: 0,
         }
@@ -243,10 +243,6 @@ where
         let data_len = data.len() as i64;
         let curr_seq = self.buffer.seq as i64;
 
-        // X2 - X1 <= widow_len
-        if data_len > buffer_len {
-            return Err(PacketTooBigError);
-        }
         if (flags & SYN_MASK) != 0 && (!self.state.is_established()) {
 
             let new_connection = self.state.is_fin() || self.state.is_closed();
@@ -254,6 +250,7 @@ where
             self.buffer.fill_zero();
             self.buffer.seq = next_seq;
             self.buffer.seq_add(1);
+
             return Ok((0, None, None, false, false, new_connection, self.is_fin()));
         } else if self.is_closed() {
             return Ok((0, None, None, false, false, false, self.is_fin()));
@@ -264,6 +261,11 @@ where
 
         if !self.state.is_established() {
             return Ok((0, None, None, false, false, false, self.is_fin()));
+        }
+
+        // X2 - X1 <= widow_len
+        if data_len > buffer_len {
+            return Err(PacketTooBigError);
         }
 
         let next_seq = next_seq as i64;
@@ -336,6 +338,20 @@ where
             false,
             self.state.is_fin(),
         ))
+    }
+
+    pub fn update_recv_ack(&mut self, ack_number: u32) {
+        let TcpPeerState::SynSent(syn_sent) = self.state else {
+            return;
+        };
+
+        if ack_number == syn_sent.wrapping_add(1) {
+            self.state = TcpPeerState::Established;
+            self.buffer = CircularSeqBuffer::new(BUFFER_SIZE);
+            self.buffer.fill_zero();
+            self.buffer.seq = syn_sent;
+            self.buffer.seq_add(1);
+        }
     }
 
     /// Pulls packets from the future queue, if they are not futures anymore.
@@ -553,6 +569,7 @@ where
         }
 
         let seq = tcp_seq(tcp_payload);
+        let maybe_ack = tcp_ack(tcp_payload);
         let flags = tcp_payload[TCP_FLAGS_IDX];
         let header_len = tcp_header_len(tcp_payload);
 
@@ -574,6 +591,12 @@ where
 
             if is_fin && self.dst_tracker.is_fin() {
                 closing = true;
+            }
+
+            if !is_future {
+                if let Some(ack_number) = maybe_ack {
+                    self.dst_tracker.update_recv_ack(ack_number);
+                }
             }
 
             Ok((
@@ -599,6 +622,12 @@ where
 
             if is_fin && self.src_tracker.is_fin() {
                 closing = true;
+            }
+
+            if !is_future {
+                if let Some(ack_number) = maybe_ack {
+                    self.src_tracker.update_recv_ack(ack_number);
+                }
             }
 
             Ok((
