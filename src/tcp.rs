@@ -8,7 +8,7 @@ use std::time::Instant;
 use crate::TransportPacketParent;
 use crate::deque::{DequeSlice, DequeSliceMut};
 use crate::tcp_util::{
-    FIN_MASK, RST_MASK, SYN_MASK, TCP_FLAGS_IDX, tcp_fin, tcp_header_len, tcp_seq,
+    FIN_MASK, RST_MASK, SYN_MASK, TCP_FLAGS_IDX, tcp_ack, tcp_fin, tcp_header_len, tcp_seq,
 };
 use crate::util::CircularSeqBuffer;
 
@@ -22,6 +22,8 @@ pub enum SnarfTcpError {
     PacketTooBigError,
     PacketOutsideWindow,
     FutureQueueOverflow,
+    AckNotFoundInSyn,
+    InvalidAckInSyn,
 }
 use SnarfTcpError::*;
 
@@ -166,12 +168,30 @@ impl TcpPeerState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum TcpPeerRecvState {
+    RecvInit,
+    RecvSynSeq(u32),
+    RecvDone,
+}
+
+impl TcpPeerRecvState {
+    pub fn new() -> Self {
+        Self::RecvInit
+    }
+
+    pub fn is_init(&self) -> bool {
+        return matches!(self, Self::RecvInit);
+    }
+}
+
 #[derive(Debug)]
 pub struct TcpPeerTracker<RF>
 where
     RF: TransportPacketParent,
 {
     pub state: TcpPeerState,
+    pub recv_state: TcpPeerRecvState,
 
     pub buffer: CircularSeqBuffer,
     pub future: Vec<FuturePacket<RF>>,
@@ -185,6 +205,7 @@ where
     pub fn new() -> Self {
         Self {
             state: TcpPeerState::new(),
+            recv_state: TcpPeerRecvState::new(),
 
             buffer: CircularSeqBuffer::new(2),
             future: vec![],
@@ -206,8 +227,10 @@ where
         &'a mut self,
         flags: u8,
         next_seq: u32,
+        ack: Option<u32>,
         data: &mut [u8],
     ) -> Result<TcpTrackerUpdateResult<'a>> {
+        use TcpPeerRecvState::*;
         use TcpPeerState::*;
         /*
          * S = seq of the first byte still available in the window
@@ -244,6 +267,17 @@ where
         let curr_seq = self.buffer.seq as i64;
 
         if (flags & SYN_MASK) != 0 && (!self.state.is_established()) {
+            if let RecvSynSeq(recv_syn_seq) = self.recv_state.clone() {
+                let Some(ack_num) = ack else {
+                    return Err(AckNotFoundInSyn);
+                };
+
+                if ack_num != recv_syn_seq.wrapping_add(1) {
+                    return Err(InvalidAckInSyn);
+                }
+
+                self.recv_state = RecvDone;
+            }
 
             let new_connection = self.state.is_fin() || self.state.is_closed();
             self.state = SynSent(next_seq);
@@ -252,10 +286,15 @@ where
             self.buffer.seq_add(1);
 
             return Ok((0, None, None, false, false, new_connection, self.is_fin()));
-        } else if self.is_closed() {
+        }
+
+        if self.state.is_closed() {
             return Ok((0, None, None, false, false, false, self.is_fin()));
-        } else if (flags & RST_MASK) != 0 {
+        }
+
+        if (flags & RST_MASK) != 0 {
             self.state = SessionClosed;
+            self.recv_state = RecvInit;
             return Ok((0, None, None, false, true, false, self.is_fin()));
         }
 
@@ -310,6 +349,7 @@ where
         let mut increase_data_len = new_data_len;
         if (flags & FIN_MASK) != 0 {
             self.state = SessionFin;
+            self.recv_state = RecvInit;
             if new_data_len == 0 {
                 self.buffer.update(1);
                 return Ok((0, None, None, false, false, false, self.is_fin()));
@@ -340,6 +380,17 @@ where
         ))
     }
 
+    pub fn update_recv_syn(&mut self, seq: u32) {
+        use TcpPeerRecvState::*;
+
+        match self.recv_state.clone() {
+            RecvInit | RecvSynSeq(..) => {
+                self.recv_state = TcpPeerRecvState::RecvSynSeq(seq);
+            }
+            _ => {}
+        }
+    }
+
     pub fn update_recv_ack(&mut self, ack_number: u32) {
         let TcpPeerState::SynSent(syn_sent) = self.state else {
             return;
@@ -360,6 +411,7 @@ where
     /// expected SEQ for the peer. Future packets can be pulled from the queue
     /// after an `update` call that provides the missing bytes before the future.
     pub fn update_future_queue<'a>(&'a mut self) -> Vec<FutureVerdict<'a, RF>> {
+        use TcpPeerRecvState::*;
         use TcpPeerState::*;
 
         if self.state.is_init() {
@@ -406,6 +458,7 @@ where
             if is_fin {
                 self.buffer.update(1);
                 self.state = SessionFin;
+                self.recv_state = RecvInit;
             }
 
             let verdict = (packet, new_data_len as usize, is_fin);
@@ -587,13 +640,14 @@ where
                 mut closing,
                 new_connection,
                 is_fin,
-            ) = self.src_tracker.update(flags, seq, data)?;
+            ) = self.src_tracker.update(flags, seq, maybe_ack, data)?;
 
             if is_fin && self.dst_tracker.is_fin() {
                 closing = true;
             }
 
             if !is_future {
+                self.dst_tracker.update_recv_syn(seq);
                 if let Some(ack_number) = maybe_ack {
                     self.dst_tracker.update_recv_ack(ack_number);
                 }
@@ -618,13 +672,14 @@ where
                 mut closing,
                 new_connection,
                 is_fin,
-            ) = self.dst_tracker.update(flags, seq, data)?;
+            ) = self.dst_tracker.update(flags, seq, maybe_ack, data)?;
 
             if is_fin && self.src_tracker.is_fin() {
                 closing = true;
             }
 
             if !is_future {
+                self.src_tracker.update_recv_syn(seq);
                 if let Some(ack_number) = maybe_ack {
                     self.src_tracker.update_recv_ack(ack_number);
                 }

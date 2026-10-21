@@ -7,6 +7,7 @@ pub const TCP_DSTPORT_OFFSET: usize = 2;
 pub const TCP_DATAOFFSET_IDX: usize = 12;
 pub const TCP_FLAGS_IDX: usize = 13;
 pub const TCP_SEQ_OFFSET: usize = 4;
+pub const TCP_ACK_OFFSET: usize = 8;
 pub const FIN_MASK: u8 = 0x1;
 pub const SYN_MASK: u8 = 0x2;
 pub const RST_MASK: u8 = 0x4;
@@ -45,6 +46,20 @@ pub fn tcp_seq(tcp_payload: &[u8]) -> u32 {
         tcp_payload[TCP_SEQ_OFFSET + 2],
         tcp_payload[TCP_SEQ_OFFSET + 3],
     ])
+}
+
+#[inline(always)]
+pub fn tcp_ack(tcp_payload: &[u8]) -> Option<u32> {
+    if tcp_flags(tcp_payload) & ACK_MASK == 0 {
+        None
+    } else {
+        Some(u32::from_be_bytes([
+            tcp_payload[TCP_ACK_OFFSET],
+            tcp_payload[TCP_ACK_OFFSET + 1],
+            tcp_payload[TCP_ACK_OFFSET + 2],
+            tcp_payload[TCP_ACK_OFFSET + 3],
+        ]))
+    }
 }
 
 #[inline(always)]
