@@ -953,6 +953,7 @@ mod test_snarf_tcp {
         ) -> InterceptVerdict {
             InterceptVerdict::Accept
         }
+        fn close(&mut self, _session_id: u64, _is_client: bool) {}
     }
 
     #[allow(dead_code)]
@@ -991,6 +992,7 @@ mod test_snarf_tcp {
         Before(PacketEvent),
         After(PacketEvent),
         Close(PacketEvent),
+        Error(PacketEvent),
     }
 
     #[derive(Default)]
@@ -1043,6 +1045,25 @@ mod test_snarf_tcp {
                 None,
             )));
         }
+        fn error(
+            &mut self,
+            net_header: &[u8],
+            transport_header: &[u8],
+            data: &[u8],
+            session_id: u64,
+            _err: SnarfTcpError,
+        ) -> InterceptVerdict {
+            self.events.push(SpyEvent::Error(PacketEvent::new(
+                net_header,
+                transport_header,
+                data,
+                session_id,
+                None,
+                None,
+            )));
+
+            InterceptVerdict::Accept
+        }
     }
 
     impl TransportSnarfSpy for Rc<RefCell<TSpy>> {
@@ -1076,6 +1097,17 @@ mod test_snarf_tcp {
         }
         fn close(&mut self, is_client: bool, session_id: u64) {
             self.borrow_mut().close(is_client, session_id)
+        }
+        fn error(
+            &mut self,
+            net_header: &[u8],
+            transport_header: &[u8],
+            data: &[u8],
+            session_id: u64,
+            err: SnarfTcpError,
+        ) -> InterceptVerdict {
+            self.borrow_mut()
+                .error(net_header, transport_header, data, session_id, err)
         }
     }
 

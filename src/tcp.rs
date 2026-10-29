@@ -3,6 +3,7 @@ use std::hash::Hash;
 use std::mem;
 use std::ops::{Index, IndexMut};
 use std::slice::SliceIndex;
+use std::sync::RwLock;
 use std::time::Instant;
 
 use crate::TransportPacketParent;
@@ -14,7 +15,7 @@ use crate::util::CircularSeqBuffer;
 
 pub const SEQ_LIM: i64 = u32::MAX as i64 + 1;
 
-const BUFFER_SIZE: usize = 65535 * 32;
+static BUFFER_SIZE: RwLock<usize> = RwLock::new(65535 * 32);
 const MAX_FUTURE_SIZE: usize = 65535 * 32;
 
 #[derive(Debug, Clone)]
@@ -304,6 +305,9 @@ where
         }
 
         if !self.state.is_established() {
+            if self.state.is_fin() {
+                return Ok((data.len(), None, None, false, false, false, self.is_fin()));
+            }
             return Ok((0, None, None, false, false, false, self.is_fin()));
         }
 
@@ -353,8 +357,10 @@ where
 
         let mut increase_data_len = new_data_len;
         if (flags & FIN_MASK) != 0 {
-            self.state = SessionFin;
-            self.recv_state = RecvInit;
+            if !self.state.is_fin() {
+                self.state = SessionFin;
+                self.recv_state = RecvInit;
+            }
             if new_data_len == 0 {
                 self.buffer.update(1);
                 return Ok((0, None, None, false, false, false, self.is_fin()));
@@ -403,7 +409,7 @@ where
 
         if ack_number == syn_sent.wrapping_add(1) {
             self.state = TcpPeerState::Established;
-            self.buffer = CircularSeqBuffer::new(BUFFER_SIZE);
+            self.buffer = CircularSeqBuffer::new(*BUFFER_SIZE.read().unwrap());
             self.buffer.fill_zero();
             self.buffer.seq = syn_sent;
             self.buffer.seq_add(1);
@@ -738,6 +744,10 @@ where
     }
 }
 
+pub fn set_global_config(buffer_size: usize) {
+    *BUFFER_SIZE.write().unwrap() = buffer_size;
+}
+
 #[cfg(test)]
 mod helpers_test_tcp_peer_tracker {
     use super::*;
@@ -752,7 +762,7 @@ mod helpers_test_tcp_peer_tracker {
             const DUMMY_HEADER_LEN: usize = 21;
             let mut buf = data.to_vec();
             let (retransmitted, writable, _, is_future, _, _, _) =
-                self.update(flags, next_seq, &mut buf)?;
+                self.update(flags, next_seq, None, &mut buf)?;
 
             if let Some(mut writable) = writable {
                 writable.copy_from_slice(&data[retransmitted..]);
@@ -769,12 +779,13 @@ mod helpers_test_tcp_peer_tracker {
             &mut self,
             flags: u8,
             next_seq: u32,
+            ack: Option<u32>,
             data: &[u8],
         ) -> Result<usize> {
             const DUMMY_HEADER_LEN: usize = 21;
             let mut buf = data.to_vec();
             let (retransmitted, writable, _, is_future, _, _, _) =
-                self.update(flags, next_seq, &mut buf)?;
+                self.update(flags, next_seq, ack, &mut buf)?;
 
             assert!(retransmitted == 0);
             assert!(buf == data);
@@ -793,6 +804,13 @@ mod helpers_test_tcp_peer_tracker {
 
             Ok(0)
         }
+
+        pub fn establish_connection_after_syn(&mut self) {
+            let TcpPeerState::SynSent(syn_sent) = self.state else {
+                panic!("Can't receive ACK. Peer tracker is not in SynSent state.")
+            };
+            self.update_recv_ack(syn_sent.wrapping_add(1));
+        }
     }
 
     impl TransportPacketParent for Vec<u8> {
@@ -801,15 +819,14 @@ mod helpers_test_tcp_peer_tracker {
         }
     }
 
-    pub const BUFFER_SIZE: usize = 100;
-
     pub fn tcp_peer_tracker() -> TcpPeerTracker<Vec<u8>> {
+        set_global_config(100);
         TcpPeerTracker {
-            first_seq: false,
-            fin: false,
-            closed: false,
+            state: TcpPeerState::new(),
+            recv_state: TcpPeerRecvState::new(),
 
-            buffer: CircularSeqBuffer::new(BUFFER_SIZE),
+            // The BUFFER_SIZE referenced here is redefined in the test context
+            buffer: CircularSeqBuffer::new(*BUFFER_SIZE.read().unwrap()),
             future: vec![],
             future_size: 0,
         }
@@ -832,14 +849,14 @@ mod helpers_test_tcp_peer_tracker {
 mod test_tcp_peer_tracker_buffer {
     use super::*;
     use helpers_test_tcp_peer_tracker::*;
-    // Explicit because super also has BUFFER_SIZE
-    use helpers_test_tcp_peer_tracker::BUFFER_SIZE;
 
     #[test]
     fn test_first_syn() {
         let mut t = tcp_peer_tracker();
 
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
         assert_eq!(t.seq(), 21)
     }
 
@@ -848,7 +865,7 @@ mod test_tcp_peer_tracker_buffer {
         let mut t = tcp_peer_tracker();
 
         let _ = t
-            .update_and_copy_assume_new(SYN_MASK, u32::MAX, &[])
+            .update_and_copy_assume_new(SYN_MASK, u32::MAX, None, &[])
             .unwrap();
         assert_eq!(t.seq(), 0)
     }
@@ -856,11 +873,14 @@ mod test_tcp_peer_tracker_buffer {
     #[test]
     fn test_buffer() {
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data = pseudorandom_data(5);
-        let written = t.update_and_copy_assume_new(0, 21, &data).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data).unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data);
@@ -868,7 +888,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Second segment
         let data = pseudorandom_data(7);
-        let written = t.update_and_copy_assume_new(0, 26, &data).unwrap();
+        let written = t.update_and_copy_assume_new(0, 26, None, &data).unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data);
@@ -879,13 +899,14 @@ mod test_tcp_peer_tracker_buffer {
     fn test_buffer_seq_wrap() {
         let mut t = tcp_peer_tracker();
         let _ = t
-            .update_and_copy_assume_new(SYN_MASK, u32::MAX - 10, &[])
+            .update_and_copy_assume_new(SYN_MASK, u32::MAX - 10, None, &[])
             .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment (not wrapping)
         let data = pseudorandom_data(5);
         let written = t
-            .update_and_copy_assume_new(0, u32::MAX - 9, &data)
+            .update_and_copy_assume_new(0, u32::MAX - 9, None, &data)
             .unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
@@ -895,7 +916,7 @@ mod test_tcp_peer_tracker_buffer {
         // Second segment (wrapping)
         let data = pseudorandom_data(7);
         let written = t
-            .update_and_copy_assume_new(0, u32::MAX - 4, &data)
+            .update_and_copy_assume_new(0, u32::MAX - 4, None, &data)
             .unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
@@ -904,7 +925,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Third segment (not wrapping)
         let data = pseudorandom_data(3);
-        let written = t.update_and_copy_assume_new(0, 2, &data).unwrap();
+        let written = t.update_and_copy_assume_new(0, 2, None, &data).unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data);
@@ -914,11 +935,14 @@ mod test_tcp_peer_tracker_buffer {
     #[test]
     fn test_buffer_reordered() {
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data = pseudorandom_data(5);
-        let written = t.update_and_copy_assume_new(0, 21, &data).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data).unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data);
@@ -926,7 +950,9 @@ mod test_tcp_peer_tracker_buffer {
 
         // Second segment (future)
         let data_future = pseudorandom_data(7);
-        let written = t.update_and_copy_assume_new(0, 27, &data_future).unwrap();
+        let written = t
+            .update_and_copy_assume_new(0, 27, None, &data_future)
+            .unwrap();
         assert_eq!(written, 0);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, &[]);
@@ -934,14 +960,16 @@ mod test_tcp_peer_tracker_buffer {
 
         // Third segment (before second)
         let data = pseudorandom_data(1);
-        let written = t.update_and_copy_assume_new(0, 26, &data).unwrap();
+        let written = t.update_and_copy_assume_new(0, 26, None, &data).unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data);
         assert_eq!(buf2, &[]);
 
         // Second segment again (should be accepted now)
-        let written = t.update_and_copy_assume_new(0, 27, &data_future).unwrap();
+        let written = t
+            .update_and_copy_assume_new(0, 27, None, &data_future)
+            .unwrap();
         assert_eq!(written, data_future.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data_future);
@@ -951,11 +979,14 @@ mod test_tcp_peer_tracker_buffer {
     #[test]
     fn test_buffer_reordered_with_overlap() {
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data = pseudorandom_data(5);
-        let written = t.update_and_copy_assume_new(0, 21, &data).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data).unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data);
@@ -963,7 +994,9 @@ mod test_tcp_peer_tracker_buffer {
 
         // Second segment (future)
         let data_future = pseudorandom_data(7);
-        let written = t.update_and_copy_assume_new(0, 27, &data_future).unwrap();
+        let written = t
+            .update_and_copy_assume_new(0, 27, None, &data_future)
+            .unwrap();
         assert_eq!(written, 0);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, &[]);
@@ -971,7 +1004,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Third segment (before second) that overlaps with second
         let data = pseudorandom_data(3);
-        let written = t.update_and_copy_assume_new(0, 26, &data).unwrap();
+        let written = t.update_and_copy_assume_new(0, 26, None, &data).unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data);
@@ -988,11 +1021,12 @@ mod test_tcp_peer_tracker_buffer {
 
     #[test]
     fn test_buffer_wraps() {
-        let bufsiz = BUFFER_SIZE;
-        let bufsizu32 = BUFFER_SIZE as u32;
+        let bufsiz = *BUFFER_SIZE.read().unwrap();
+        let bufsizu32 = bufsiz as u32;
 
         let mut t = tcp_peer_tracker();
-        t.update(SYN_MASK, 20, &mut []).unwrap();
+        t.update(SYN_MASK, 20, None, &mut []).unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         /*
@@ -1000,7 +1034,7 @@ mod test_tcp_peer_tracker_buffer {
          * Segment: [.......]
          * */
         let data = pseudorandom_data(bufsiz);
-        let written = t.update_and_copy_assume_new(0, 21, &data).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data).unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data);
@@ -1013,7 +1047,7 @@ mod test_tcp_peer_tracker_buffer {
          * */
         let data = pseudorandom_data(1);
         let written = t
-            .update_and_copy_assume_new(0, 21 + bufsizu32, &data)
+            .update_and_copy_assume_new(0, 21 + bufsizu32, None, &data)
             .unwrap();
         assert_eq!(written, 1);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
@@ -1027,7 +1061,7 @@ mod test_tcp_peer_tracker_buffer {
          * */
         let data = pseudorandom_data(bufsiz - 2);
         let written = t
-            .update_and_copy_assume_new(0, 22 + bufsizu32, &data)
+            .update_and_copy_assume_new(0, 22 + bufsizu32, None, &data)
             .unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
@@ -1041,7 +1075,7 @@ mod test_tcp_peer_tracker_buffer {
          * */
         let data = pseudorandom_data(bufsiz - 2);
         let written = t
-            .update_and_copy_assume_new(0, 20 + 2 * bufsizu32, &data)
+            .update_and_copy_assume_new(0, 20 + 2 * bufsizu32, None, &data)
             .unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
@@ -1051,33 +1085,36 @@ mod test_tcp_peer_tracker_buffer {
 
     #[test]
     fn test_segment_bigger_than_buffer() {
+        let bufsiz = *BUFFER_SIZE.read().unwrap();
         let mut t = tcp_peer_tracker();
-        t.update(SYN_MASK, 20, &mut []).unwrap();
+        t.update(SYN_MASK, 20, None, &mut []).unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
-        let data = pseudorandom_data(BUFFER_SIZE + 1);
-        let ret = t.update_and_copy_assume_new(0, 21, &data);
+        let data = pseudorandom_data(bufsiz + 1);
+        let ret = t.update_and_copy_assume_new(0, 21, None, &data);
         assert!(matches!(ret, Err(PacketTooBigError)));
 
         // First segment, shorter
         // Seq shuoldn't change, so the entire package should be accepted
         let written = t
-            .update_and_copy_assume_new(0, 21, &data[..BUFFER_SIZE])
+            .update_and_copy_assume_new(0, 21, None, &data[..bufsiz])
             .unwrap();
-        assert_eq!(written, BUFFER_SIZE);
+        assert_eq!(written, bufsiz);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
-        assert_eq!(buf1, &data[..BUFFER_SIZE]);
+        assert_eq!(buf1, &data[..bufsiz]);
         assert_eq!(buf2, &[]);
     }
 
     #[test]
     fn test_segment_retransmission() {
         let mut t = tcp_peer_tracker();
-        t.update(SYN_MASK, 20, &mut []).unwrap();
+        t.update(SYN_MASK, 20, None, &mut []).unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(10);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data1);
@@ -1085,7 +1122,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Second segment
         let data2 = pseudorandom_data(9);
-        let written = t.update_and_copy_assume_new(0, 31, &data2).unwrap();
+        let written = t.update_and_copy_assume_new(0, 31, None, &data2).unwrap();
         assert_eq!(written, data2.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data2);
@@ -1093,7 +1130,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Third segment
         let data3 = pseudorandom_data(8);
-        let written = t.update_and_copy_assume_new(0, 40, &data3).unwrap();
+        let written = t.update_and_copy_assume_new(0, 40, None, &data3).unwrap();
         assert_eq!(written, data3.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data3);
@@ -1125,7 +1162,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Fourth segment
         let data4 = pseudorandom_data(8);
-        let written = t.update_and_copy_assume_new(0, 48, &data4).unwrap();
+        let written = t.update_and_copy_assume_new(0, 48, None, &data4).unwrap();
         assert_eq!(written, data4.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data4);
@@ -1135,11 +1172,12 @@ mod test_tcp_peer_tracker_buffer {
     #[test]
     fn test_segment_partial_retransmission() {
         let mut t = tcp_peer_tracker();
-        t.update(SYN_MASK, 20, &mut []).unwrap();
+        t.update(SYN_MASK, 20, None, &mut []).unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(10);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data1);
@@ -1147,7 +1185,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Second segment
         let data2 = pseudorandom_data(9);
-        let written = t.update_and_copy_assume_new(0, 31, &data2).unwrap();
+        let written = t.update_and_copy_assume_new(0, 31, None, &data2).unwrap();
         assert_eq!(written, data2.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data2);
@@ -1193,7 +1231,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Fourth segment
         let data4 = pseudorandom_data(7);
-        let written = t.update_and_copy_assume_new(0, 49, &data4).unwrap();
+        let written = t.update_and_copy_assume_new(0, 49, None, &data4).unwrap();
         assert_eq!(written, data4.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data4);
@@ -1203,11 +1241,12 @@ mod test_tcp_peer_tracker_buffer {
     #[test]
     fn test_segment_retransmission_rewrite() {
         let mut t = tcp_peer_tracker();
-        t.update(SYN_MASK, 20, &mut []).unwrap();
+        t.update(SYN_MASK, 20, None, &mut []).unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(10);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data1);
@@ -1215,7 +1254,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Second segment
         let data2 = pseudorandom_data(9);
-        let written = t.update_and_copy_assume_new(0, 31, &data2).unwrap();
+        let written = t.update_and_copy_assume_new(0, 31, None, &data2).unwrap();
         assert_eq!(written, data2.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data2);
@@ -1223,7 +1262,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Third segment
         let data3 = pseudorandom_data(8);
-        let written = t.update_and_copy_assume_new(0, 40, &data3).unwrap();
+        let written = t.update_and_copy_assume_new(0, 40, None, &data3).unwrap();
         assert_eq!(written, data3.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data3);
@@ -1264,7 +1303,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Fourth segment
         let data4 = pseudorandom_data(8);
-        let written = t.update_and_copy_assume_new(0, 48, &data4).unwrap();
+        let written = t.update_and_copy_assume_new(0, 48, None, &data4).unwrap();
         assert_eq!(written, data4.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data4);
@@ -1274,11 +1313,12 @@ mod test_tcp_peer_tracker_buffer {
     #[test]
     fn test_segment_partial_retransmission_rewrite() {
         let mut t = tcp_peer_tracker();
-        t.update(SYN_MASK, 20, &mut []).unwrap();
+        t.update(SYN_MASK, 20, None, &mut []).unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(10);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data1);
@@ -1286,7 +1326,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Second segment
         let data2 = pseudorandom_data(9);
-        let written = t.update_and_copy_assume_new(0, 31, &data2).unwrap();
+        let written = t.update_and_copy_assume_new(0, 31, None, &data2).unwrap();
         assert_eq!(written, data2.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data2);
@@ -1360,7 +1400,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Fourth segment
         let data4 = pseudorandom_data(7);
-        let written = t.update_and_copy_assume_new(0, 49, &data4).unwrap();
+        let written = t.update_and_copy_assume_new(0, 49, None, &data4).unwrap();
         assert_eq!(written, data4.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data4);
@@ -1370,11 +1410,14 @@ mod test_tcp_peer_tracker_buffer {
     #[test]
     fn test_future_consumed() {
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data = pseudorandom_data(5);
-        let written = t.update_and_copy_assume_new(0, 21, &data).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data).unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data);
@@ -1382,7 +1425,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Second segment (future)
         let data2 = pseudorandom_data(7);
-        let written = t.update_and_copy_assume_new(0, 27, &data2).unwrap();
+        let written = t.update_and_copy_assume_new(0, 27, None, &data2).unwrap();
         assert_eq!(written, 0);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, &[]);
@@ -1393,7 +1436,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // 1 byte before Second segment (future)
         let data = pseudorandom_data(1);
-        let written = t.update_and_copy_assume_new(0, 26, &data).unwrap();
+        let written = t.update_and_copy_assume_new(0, 26, None, &data).unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data);
@@ -1409,11 +1452,14 @@ mod test_tcp_peer_tracker_buffer {
     #[test]
     fn test_future_unconsumed() {
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data = pseudorandom_data(5);
-        let written = t.update_and_copy_assume_new(0, 21, &data).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data).unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data);
@@ -1421,7 +1467,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Second segment (future)
         let data = pseudorandom_data(7);
-        let written = t.update_and_copy_assume_new(0, 27, &data).unwrap();
+        let written = t.update_and_copy_assume_new(0, 27, None, &data).unwrap();
         assert_eq!(written, 0);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, &[]);
@@ -1434,11 +1480,14 @@ mod test_tcp_peer_tracker_buffer {
     #[test]
     fn test_future_eaten_by_next_segment() {
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(5);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data1);
@@ -1446,7 +1495,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Second segment (future)
         let data2 = pseudorandom_data(7);
-        let written = t.update_and_copy_assume_new(0, 27, &data2).unwrap();
+        let written = t.update_and_copy_assume_new(0, 27, None, &data2).unwrap();
         assert_eq!(written, 0);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, &[]);
@@ -1455,7 +1504,7 @@ mod test_tcp_peer_tracker_buffer {
         // 1 byte + Second segment
         let data3 = pseudorandom_data(1);
         let data: Vec<_> = data3.iter().chain(&data2).copied().collect();
-        let written = t.update_and_copy_assume_new(0, 26, &data).unwrap();
+        let written = t.update_and_copy_assume_new(0, 26, None, &data).unwrap();
         assert_eq!(written, 1 + data2.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data);
@@ -1469,11 +1518,14 @@ mod test_tcp_peer_tracker_buffer {
     #[test]
     fn test_future_eaten_by_segment_with_retransmitted() {
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(5);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data1);
@@ -1481,7 +1533,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Second segment (future)
         let data2 = pseudorandom_data(7);
-        let written = t.update_and_copy_assume_new(0, 36, &data2).unwrap();
+        let written = t.update_and_copy_assume_new(0, 36, None, &data2).unwrap();
         assert_eq!(written, 0);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, &[]);
@@ -1511,11 +1563,14 @@ mod test_tcp_peer_tracker_buffer {
     #[test]
     fn test_multi_future_eaten_by_segment() {
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(5);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data1);
@@ -1523,22 +1578,22 @@ mod test_tcp_peer_tracker_buffer {
 
         // Fifth segment (future)
         let data5 = pseudorandom_data(9);
-        let written = t.update_and_copy_assume_new(0, 57, &data5).unwrap();
+        let written = t.update_and_copy_assume_new(0, 57, None, &data5).unwrap();
         assert_eq!(written, 0);
 
         // Fourth segment (future)
         let data4 = pseudorandom_data(8);
-        let written = t.update_and_copy_assume_new(0, 49, &data4).unwrap();
+        let written = t.update_and_copy_assume_new(0, 49, None, &data4).unwrap();
         assert_eq!(written, 0);
 
         // Second segment (future)
         let data2 = pseudorandom_data(6);
-        let written = t.update_and_copy_assume_new(0, 36, &data2).unwrap();
+        let written = t.update_and_copy_assume_new(0, 36, None, &data2).unwrap();
         assert_eq!(written, 0);
 
         // Third segment (future)
         let data3 = pseudorandom_data(7);
-        let written = t.update_and_copy_assume_new(0, 42, &data3).unwrap();
+        let written = t.update_and_copy_assume_new(0, 42, None, &data3).unwrap();
         assert_eq!(written, 0);
 
         // missing gap + Second segment + Third segment + 1 byte of fourth segment + Fifth segment
@@ -1550,7 +1605,7 @@ mod test_tcp_peer_tracker_buffer {
             .chain(&data4[..1])
             .copied()
             .collect();
-        let written = t.update_and_copy_assume_new(0, 26, &data).unwrap();
+        let written = t.update_and_copy_assume_new(0, 26, None, &data).unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, &data);
@@ -1583,11 +1638,14 @@ mod test_tcp_peer_tracker_buffer {
     #[test]
     fn test_futures_overlap() {
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(5);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data1);
@@ -1595,7 +1653,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Second segment (future)
         let data2 = pseudorandom_data(7);
-        let written = t.update_and_copy_assume_new(0, 27, &data2).unwrap();
+        let written = t.update_and_copy_assume_new(0, 27, None, &data2).unwrap();
         assert_eq!(written, 0);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, &[]);
@@ -1608,7 +1666,7 @@ mod test_tcp_peer_tracker_buffer {
             .chain(&data3)
             .copied()
             .collect();
-        let written = t.update_and_copy_assume_new(0, 31, &data).unwrap();
+        let written = t.update_and_copy_assume_new(0, 31, None, &data).unwrap();
         assert_eq!(written, 0);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, &[]);
@@ -1616,7 +1674,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Fourth segment (future)
         let data4 = pseudorandom_data(9);
-        let written = t.update_and_copy_assume_new(0, 42, &data4).unwrap();
+        let written = t.update_and_copy_assume_new(0, 42, None, &data4).unwrap();
         assert_eq!(written, 0);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, &[]);
@@ -1629,7 +1687,7 @@ mod test_tcp_peer_tracker_buffer {
             .chain(&data5)
             .copied()
             .collect();
-        let written = t.update_and_copy_assume_new(0, 47, &data).unwrap();
+        let written = t.update_and_copy_assume_new(0, 47, None, &data).unwrap();
         assert_eq!(written, 0);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, &[]);
@@ -1678,11 +1736,14 @@ mod test_tcp_peer_tracker_buffer {
     #[test]
     fn test_futures_with_gaps() {
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(5);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data1);
@@ -1690,7 +1751,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Second segment (future)
         let data2 = pseudorandom_data(7);
-        let written = t.update_and_copy_assume_new(0, 27, &data2).unwrap();
+        let written = t.update_and_copy_assume_new(0, 27, None, &data2).unwrap();
         assert_eq!(written, 0);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, &[]);
@@ -1703,7 +1764,7 @@ mod test_tcp_peer_tracker_buffer {
             .chain(&data3)
             .copied()
             .collect();
-        let written = t.update_and_copy_assume_new(0, 31, &data).unwrap();
+        let written = t.update_and_copy_assume_new(0, 31, None, &data).unwrap();
         assert_eq!(written, 0);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, &[]);
@@ -1711,7 +1772,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Fourth segment (future), not connected to the third
         let data4 = pseudorandom_data(9);
-        let written = t.update_and_copy_assume_new(0, 43, &data4).unwrap();
+        let written = t.update_and_copy_assume_new(0, 43, None, &data4).unwrap();
         assert_eq!(written, 0);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, &[]);
@@ -1719,7 +1780,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Fifth segment (future, and overlapping with fourth), not connected to the fourth
         let data5 = pseudorandom_data(10);
-        let written = t.update_and_copy_assume_new(0, 55, &data5).unwrap();
+        let written = t.update_and_copy_assume_new(0, 55, None, &data5).unwrap();
         assert_eq!(written, 0);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, &[]);
@@ -1728,7 +1789,7 @@ mod test_tcp_peer_tracker_buffer {
         // missing bytes + Second segment
         let data_miss = pseudorandom_data(1);
         let data: Vec<_> = data_miss.iter().chain(&data2).copied().collect();
-        let written = t.update_and_copy_assume_new(0, 26, &data).unwrap();
+        let written = t.update_and_copy_assume_new(0, 26, None, &data).unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, &data);
@@ -1749,7 +1810,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // missing bytes until the fourth segment
         let data = pseudorandom_data(1);
-        let written = t.update_and_copy_assume_new(0, 42, &data).unwrap();
+        let written = t.update_and_copy_assume_new(0, 42, None, &data).unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, &data);
@@ -1790,11 +1851,14 @@ mod test_tcp_peer_tracker_buffer {
     #[test]
     fn test_segment_overlapping_future() {
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(5);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data1);
@@ -1802,7 +1866,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Second segment (future)
         let data2 = pseudorandom_data(7);
-        let written = t.update_and_copy_assume_new(0, 27, &data2).unwrap();
+        let written = t.update_and_copy_assume_new(0, 27, None, &data2).unwrap();
         assert_eq!(written, 0);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, &[]);
@@ -1811,7 +1875,7 @@ mod test_tcp_peer_tracker_buffer {
         // 1 byte + part of second segment
         let data3 = pseudorandom_data(1);
         let data: Vec<_> = data3.iter().chain(&data2[..3]).copied().collect();
-        let written = t.update_and_copy_assume_new(0, 26, &data).unwrap();
+        let written = t.update_and_copy_assume_new(0, 26, None, &data).unwrap();
         assert_eq!(written, 1 + 3);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data);
@@ -1827,11 +1891,14 @@ mod test_tcp_peer_tracker_buffer {
     #[test]
     fn test_future_verdict_contains_correct_writable() {
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(5);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data1);
@@ -1839,7 +1906,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // Second segment (future)
         let data2 = pseudorandom_data(7);
-        let written = t.update_and_copy_assume_new(0, 27, &data2).unwrap();
+        let written = t.update_and_copy_assume_new(0, 27, None, &data2).unwrap();
         assert_eq!(written, 0);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, &[]);
@@ -1847,7 +1914,7 @@ mod test_tcp_peer_tracker_buffer {
 
         // 1 byte
         let data3 = pseudorandom_data(1);
-        let written = t.update_and_copy_assume_new(0, 26, &data3).unwrap();
+        let written = t.update_and_copy_assume_new(0, 26, None, &data3).unwrap();
         assert_eq!(written, data3.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data3);
@@ -1878,20 +1945,25 @@ mod test_tcp_peer_tracker_buffer {
     #[test]
     fn test_futures_outside_window() {
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(5);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
         assert_eq!(buf1, data1);
         assert_eq!(buf2, &[]);
 
-        let lim = (BUFFER_SIZE - 4) as u32;
+        let lim = (*BUFFER_SIZE.read().unwrap() - 4) as u32;
         for i in 0..lim {
             let data = pseudorandom_data(1);
-            let written = t.update_and_copy_assume_new(0, 30 + i, &data).unwrap();
+            let written = t
+                .update_and_copy_assume_new(0, 30 + i, None, &data)
+                .unwrap();
             assert_eq!(written, 0);
             let (buf1, buf2) = t.get_last_written_from_buffer(written);
             assert_eq!(buf1, &[]);
@@ -1899,24 +1971,25 @@ mod test_tcp_peer_tracker_buffer {
         }
 
         let data = pseudorandom_data(1);
-        let err = t.update_and_copy_assume_new(0, 30 + lim, &data);
+        let err = t.update_and_copy_assume_new(0, 30 + lim, None, &data);
         assert!(matches!(err, Err(PacketOutsideWindow)));
     }
 
     #[test]
     fn test_seq_wrap_and_buf_overlap() {
         // This tests depends on buffer size being 100
-        assert_eq!(BUFFER_SIZE, 100);
+        assert_eq!(*BUFFER_SIZE.read().unwrap(), 100);
 
         let mut t = tcp_peer_tracker();
         let _ = t
-            .update_and_copy_assume_new(SYN_MASK, u32::MAX - 201, &[])
+            .update_and_copy_assume_new(SYN_MASK, u32::MAX - 201, None, &[])
             .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment (not wrapping)
         let data = pseudorandom_data(100);
         let written = t
-            .update_and_copy_assume_new(0, u32::MAX - 200, &data)
+            .update_and_copy_assume_new(0, u32::MAX - 200, None, &data)
             .unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
@@ -1926,7 +1999,7 @@ mod test_tcp_peer_tracker_buffer {
         // Second segment (not wrapping)
         let data = pseudorandom_data(75);
         let written = t
-            .update_and_copy_assume_new(0, u32::MAX - 100, &data)
+            .update_and_copy_assume_new(0, u32::MAX - 100, None, &data)
             .unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
@@ -1936,7 +2009,7 @@ mod test_tcp_peer_tracker_buffer {
         // Third segment (wrapping in both seq and buffer)
         let data = pseudorandom_data(60);
         let written = t
-            .update_and_copy_assume_new(0, u32::MAX - 25, &data)
+            .update_and_copy_assume_new(0, u32::MAX - 25, None, &data)
             .unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
@@ -1949,20 +2022,21 @@ mod test_tcp_peer_tracker_buffer {
         // This tests depends on buffer size being 100
         let mut t = tcp_peer_tracker();
         let _ = t
-            .update_and_copy_assume_new(SYN_MASK, u32::MAX - 11, &[])
+            .update_and_copy_assume_new(SYN_MASK, u32::MAX - 11, None, &[])
             .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment (not wrapping)
         let data1 = pseudorandom_data(4);
         let written = t
-            .update_and_copy_assume_new(0, u32::MAX - 10, &data1)
+            .update_and_copy_assume_new(0, u32::MAX - 10, None, &data1)
             .unwrap();
         assert_eq!(written, data1.len());
 
         // Second segment (future, not wrapping)
         let data2 = pseudorandom_data(2);
         let written = t
-            .update_and_copy_assume_new(0, u32::MAX - 5, &data2)
+            .update_and_copy_assume_new(0, u32::MAX - 5, None, &data2)
             .unwrap();
         assert_eq!(written, 0);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
@@ -1972,7 +2046,7 @@ mod test_tcp_peer_tracker_buffer {
         // Third segment (future, gapped, wrapping)
         let data3 = pseudorandom_data(10);
         let written = t
-            .update_and_copy_assume_new(0, u32::MAX - 2, &data3)
+            .update_and_copy_assume_new(0, u32::MAX - 2, None, &data3)
             .unwrap();
         assert_eq!(written, 0);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
@@ -1990,7 +2064,7 @@ mod test_tcp_peer_tracker_buffer {
             .copied()
             .collect();
         let written = t
-            .update_and_copy_assume_new(0, u32::MAX - 6, &data)
+            .update_and_copy_assume_new(0, u32::MAX - 6, None, &data)
             .unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
@@ -2016,20 +2090,21 @@ mod test_tcp_peer_tracker_buffer {
         // This tests depends on buffer size being 100
         let mut t = tcp_peer_tracker();
         let _ = t
-            .update_and_copy_assume_new(SYN_MASK, u32::MAX - 15, &[])
+            .update_and_copy_assume_new(SYN_MASK, u32::MAX - 15, None, &[])
             .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment (not wrapping)
         let data1 = pseudorandom_data(4);
         let written = t
-            .update_and_copy_assume_new(0, u32::MAX - 14, &data1)
+            .update_and_copy_assume_new(0, u32::MAX - 14, None, &data1)
             .unwrap();
         assert_eq!(written, data1.len());
 
         // Second segment (future, not wrapping)
         let data2 = pseudorandom_data(2);
         let written = t
-            .update_and_copy_assume_new(0, u32::MAX - 9, &data2)
+            .update_and_copy_assume_new(0, u32::MAX - 9, None, &data2)
             .unwrap();
         assert_eq!(written, 0);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
@@ -2039,7 +2114,7 @@ mod test_tcp_peer_tracker_buffer {
         // Third segment (future, gapped, wrapping)
         let data3 = pseudorandom_data(10);
         let written = t
-            .update_and_copy_assume_new(0, u32::MAX - 6, &data3)
+            .update_and_copy_assume_new(0, u32::MAX - 6, None, &data3)
             .unwrap();
         assert_eq!(written, 0);
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
@@ -2057,7 +2132,7 @@ mod test_tcp_peer_tracker_buffer {
             .copied()
             .collect();
         let written = t
-            .update_and_copy_assume_new(0, u32::MAX - 10, &data)
+            .update_and_copy_assume_new(0, u32::MAX - 10, None, &data)
             .unwrap();
         assert_eq!(written, data.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written);
@@ -2082,16 +2157,19 @@ mod test_tcp_peer_tracker_buffer {
     fn test_seq_too_old() {
         // First, check the segment can be accepted, at the edge
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(4);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
 
         // Second segment
         let data2 = pseudorandom_data(96);
-        let written = t.update_and_copy_assume_new(0, 25, &data2).unwrap();
+        let written = t.update_and_copy_assume_new(0, 25, None, &data2).unwrap();
         assert_eq!(written, data2.len());
 
         // First segment retransmitted
@@ -2103,16 +2181,19 @@ mod test_tcp_peer_tracker_buffer {
         // Second, make the second segment one byte larger, which should be enough to make the first
         // segment outdated
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(4);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
 
         // Second segment
         let data2 = pseudorandom_data(97);
-        let written = t.update_and_copy_assume_new(0, 25, &data2).unwrap();
+        let written = t.update_and_copy_assume_new(0, 25, None, &data2).unwrap();
         assert_eq!(written, data2.len());
 
         // First segment retransmitted
@@ -2124,31 +2205,37 @@ mod test_tcp_peer_tracker_buffer {
     fn test_seq_too_early() {
         // First, check the segment can be accepted, at the edge
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(4);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
 
         // Second segment, future
         let data2 = pseudorandom_data(10);
-        let written = t.update_and_copy_assume_new(0, 115, &data2).unwrap();
+        let written = t.update_and_copy_assume_new(0, 115, None, &data2).unwrap();
         assert_eq!(written, 0);
 
         // Second, make the second segment one byte larger, which should be enough to make the first
         // segment outdated
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(4);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
 
         // Second segment, future
         let data2 = pseudorandom_data(10);
-        let err = t.update_and_copy_assume_new(0, 116, &data2);
+        let err = t.update_and_copy_assume_new(0, 116, None, &data2);
         assert!(matches!(err, Err(PacketOutsideWindow)))
     }
 }
@@ -2161,21 +2248,26 @@ mod test_tcp_peer_tracker_state {
     #[test]
     fn test_empty_fin() {
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(4);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
 
         // Empty FIN
-        let written = t.update_and_copy_assume_new(FIN_MASK, 25, &[]).unwrap();
+        let written = t
+            .update_and_copy_assume_new(FIN_MASK, 25, None, &[])
+            .unwrap();
         assert_eq!(written, 0);
 
-        assert!(t.fin);
+        assert!(t.is_fin());
 
         // Final ACK
-        let written = t.update_and_copy_assume_new(0, 26, &[]).unwrap();
+        let written = t.update_and_copy_assume_new(0, 26, None, &[]).unwrap();
         assert_eq!(written, 0);
 
         // Test that the ringbuffer hasn't broken after the FIN packet has increased the SEQ
@@ -2188,25 +2280,30 @@ mod test_tcp_peer_tracker_state {
     #[test]
     fn test_fin_with_data() {
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(4);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
 
         // FIN with data
         let data2 = pseudorandom_data(5);
-        let written = t.update_and_copy_assume_new(FIN_MASK, 25, &data2).unwrap();
+        let written = t
+            .update_and_copy_assume_new(FIN_MASK, 25, None, &data2)
+            .unwrap();
         assert_eq!(written, data2.len());
         let (buf1, buf2) = t.get_last_written_from_buffer(written + 1);
         assert_eq!(buf1[..buf1.len() - 1], data2);
         assert_eq!(buf2, &[]);
 
-        assert!(t.fin);
+        assert!(t.is_fin());
 
         // Final ACK
-        let written = t.update_and_copy_assume_new(0, 31, &[]).unwrap();
+        let written = t.update_and_copy_assume_new(0, 31, None, &[]).unwrap();
         assert_eq!(written, 0);
 
         // Test that the ringbuffer hasn't broken after the FIN packet has increased the SEQ
@@ -2219,19 +2316,24 @@ mod test_tcp_peer_tracker_state {
     #[test]
     fn test_fin_with_data_retransmitted() {
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(4);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
 
         // FIN with data
         let data2 = pseudorandom_data(5);
-        let written = t.update_and_copy_assume_new(FIN_MASK, 25, &data2).unwrap();
+        let written = t
+            .update_and_copy_assume_new(FIN_MASK, 25, None, &data2)
+            .unwrap();
         assert_eq!(written, data2.len());
 
-        assert!(t.fin);
+        assert!(t.is_fin());
 
         // FIN retransmission
         let (retransmitted, written, buf) = t.update_and_copy(FIN_MASK, 25, &data2).unwrap();
@@ -2240,7 +2342,7 @@ mod test_tcp_peer_tracker_state {
         assert_eq!(buf, data2);
 
         // Final ACK
-        let written = t.update_and_copy_assume_new(0, 31, &[]).unwrap();
+        let written = t.update_and_copy_assume_new(0, 31, None, &[]).unwrap();
         assert_eq!(written, 0);
 
         // Test that the ringbuffer hasn't broken after the FIN packet has increased the SEQ
@@ -2253,19 +2355,24 @@ mod test_tcp_peer_tracker_state {
     #[test]
     fn test_fin_retranmistted_diferently() {
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(4);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
 
         // FIN with data
         let data2 = pseudorandom_data(5);
-        let written = t.update_and_copy_assume_new(FIN_MASK, 25, &data2).unwrap();
+        let written = t
+            .update_and_copy_assume_new(FIN_MASK, 25, None, &data2)
+            .unwrap();
         assert_eq!(written, data2.len());
 
-        assert!(t.fin);
+        assert!(t.is_fin());
 
         // FIN empty retransmission
         let (retransmitted, written, buf) = t.update_and_copy(FIN_MASK, 30, &[]).unwrap();
@@ -2274,7 +2381,7 @@ mod test_tcp_peer_tracker_state {
         assert_eq!(buf, &[]);
 
         // Final ACK
-        let written = t.update_and_copy_assume_new(0, 31, &[]).unwrap();
+        let written = t.update_and_copy_assume_new(0, 31, None, &[]).unwrap();
         assert_eq!(written, 0);
 
         // Test that the ringbuffer hasn't broken after the FIN packet has increased the SEQ
@@ -2287,41 +2394,44 @@ mod test_tcp_peer_tracker_state {
     #[test]
     fn test_fin_future() {
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(4);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
 
         // FIN that is future
         let data2 = pseudorandom_data(5);
-        let written = t.update_and_copy_assume_new(FIN_MASK, 26, &data2).unwrap();
+        let written = t
+            .update_and_copy_assume_new(FIN_MASK, 26, None, &data2)
+            .unwrap();
         assert_eq!(written, 0);
 
-        assert!(!t.fin);
+        assert!(!t.is_fin());
 
         // Missing byte before the FIN
         let data3 = pseudorandom_data(1);
-        let written = t.update_and_copy_assume_new(0, 25, &data3).unwrap();
+        let written = t.update_and_copy_assume_new(0, 25, None, &data3).unwrap();
         assert_eq!(written, 1);
 
-        assert!(!t.fin);
+        assert!(!t.is_fin());
 
         let mut verdicts = t.update_future_queue();
         assert_eq!(verdicts.len(), 1);
         assert_eq!(verdicts[0].new_data_len, data2.len());
         verdicts[0].writable.copy_from_slice(&data2);
 
-        assert!(t.fin);
+        assert!(t.is_fin());
 
         // Final ACK
-        let written = t.update_and_copy_assume_new(0, 31, &[]).unwrap();
+        let written = t.update_and_copy_assume_new(0, 31, None, &[]).unwrap();
         assert_eq!(written, 0);
 
         // Test that the ringbuffer hasn't broken after the FIN packet has increased the SEQ
-        dbg!(&data1);
-        dbg!(&data2);
         let expected: Vec<u8> = data1.into_iter().chain(data3).chain(data2).collect();
         let mut data = vec![0; expected.len()];
         t.buffer.write_from_buffer_to_slice(&mut data, 21);
@@ -2331,34 +2441,39 @@ mod test_tcp_peer_tracker_state {
     #[test]
     fn test_fin_empty_future() {
         let mut t = tcp_peer_tracker();
-        let _ = t.update_and_copy_assume_new(SYN_MASK, 20, &[]).unwrap();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
 
         // First segment
         let data1 = pseudorandom_data(4);
-        let written = t.update_and_copy_assume_new(0, 21, &data1).unwrap();
+        let written = t.update_and_copy_assume_new(0, 21, None, &data1).unwrap();
         assert_eq!(written, data1.len());
 
         // Empty FIN that is future
-        let written = t.update_and_copy_assume_new(FIN_MASK, 26, &[]).unwrap();
+        let written = t
+            .update_and_copy_assume_new(FIN_MASK, 26, None, &[])
+            .unwrap();
         assert_eq!(written, 0);
 
-        assert!(!t.fin);
+        assert!(!t.is_fin());
 
         // Missing byte before the FIN
         let data3 = pseudorandom_data(1);
-        let written = t.update_and_copy_assume_new(0, 25, &data3).unwrap();
+        let written = t.update_and_copy_assume_new(0, 25, None, &data3).unwrap();
         assert_eq!(written, 1);
 
-        assert!(!t.fin);
+        assert!(!t.is_fin());
 
         let verdicts = t.update_future_queue();
         assert_eq!(verdicts.len(), 1);
         assert_eq!(verdicts[0].new_data_len, 0);
 
-        assert!(t.fin);
+        assert!(t.is_fin());
 
         // Final ACK
-        let written = t.update_and_copy_assume_new(0, 31, &[]).unwrap();
+        let written = t.update_and_copy_assume_new(0, 31, None, &[]).unwrap();
         assert_eq!(written, 0);
 
         // Test that the ringbuffer hasn't broken after the FIN packet has increased the SEQ
