@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use etherparse::{
     InternetSlice::{Ipv4, Ipv6},
-    SlicedPacket,
+    IpNumber, SlicedPacket,
 };
 use tokio::io::unix::AsyncFd;
 
@@ -356,13 +356,14 @@ where
             return vec![SnarfInterceptVerdict::Accept(rf)];
         };
 
-        let (src_ip, dst_ip, ip_header_len) = match &parsed.net {
+        let (src_ip, dst_ip, protocol, ip_header_len) = match &parsed.net {
             Some(Ipv4(ip)) => {
                 let header = ip.header();
 
                 (
                     header.source(),
                     header.destination(),
+                    header.protocol(),
                     (header.ihl() * 4) as usize,
                 )
             }
@@ -375,19 +376,22 @@ where
         };
         drop(parsed);
 
-        let (ip_header, tcp_payload) = payload.split_at(ip_header_len);
-        self.net_spy.before(ip_header, tcp_payload);
+        let (ip_header, transport_payload) = payload.split_at(ip_header_len);
 
-        let msg_parent = NfqMessageParent {
-            message: rf,
-            ip_header_len,
+        self.net_spy.before(ip_header, transport_payload);
+
+        let verdicts = if protocol == IpNumber::TCP {
+            let msg_parent = NfqMessageParent {
+                message: rf,
+                ip_header_len,
+            };
+            self.transport_handler
+                .on_transport_packet(src_ip, dst_ip, msg_parent)
+        } else {
+            return vec![SnarfInterceptVerdict::Accept(rf)];
         };
-        let verdicts = self
-            .transport_handler
-            .on_transport_packet(src_ip, dst_ip, msg_parent);
 
         let mut upstream_verdicts = vec![];
-
         for verdict in verdicts {
             let up_verdict = match verdict {
                 SnarfInterceptVerdict::Accept(mut rf) => {
