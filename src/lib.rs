@@ -40,7 +40,7 @@ pub enum InterceptVerdict {
 }
 
 impl InterceptVerdict {
-    fn to_snarf_intercept_verdict<RF>(self, rf: RF) -> SnarfInterceptVerdict<RF> {
+    fn into_snarf_intercept_verdict<RF>(self, rf: RF) -> SnarfInterceptVerdict<RF> {
         match self {
             InterceptVerdict::Accept => SnarfInterceptVerdict::Accept(rf),
             InterceptVerdict::Drop => SnarfInterceptVerdict::Drop(rf),
@@ -625,7 +625,7 @@ where
                 session_id,
                 res.err().unwrap(),
             );
-            return vec![verdict.to_snarf_intercept_verdict(rf)];
+            return vec![verdict.into_snarf_intercept_verdict(rf)];
         };
         let (
             mut is_client,
@@ -655,7 +655,7 @@ where
                     session_id,
                     res.err().unwrap(),
                 );
-                return vec![verdict.to_snarf_intercept_verdict(rf)];
+                return vec![verdict.into_snarf_intercept_verdict(rf)];
             };
 
             (is_client, retransmitted, writable, _, is_future, closing, _) = res;
@@ -740,7 +740,7 @@ where
             self.app_data_handler.close(session_id, true);
         }
 
-        verdicts.push(this_verdict.to_snarf_intercept_verdict(rf));
+        verdicts.push(this_verdict.into_snarf_intercept_verdict(rf));
 
         verdicts
     }
@@ -992,7 +992,7 @@ mod test_snarf_tcp {
         Before(PacketEvent),
         After(PacketEvent),
         Close(PacketEvent),
-        Error(PacketEvent),
+        Error,
     }
 
     #[derive(Default)]
@@ -1047,20 +1047,13 @@ mod test_snarf_tcp {
         }
         fn error(
             &mut self,
-            net_header: &[u8],
-            transport_header: &[u8],
-            data: &[u8],
-            session_id: u64,
+            _net_header: &[u8],
+            _transport_header: &[u8],
+            _data: &[u8],
+            _session_id: u64,
             _err: SnarfTcpError,
         ) -> InterceptVerdict {
-            self.events.push(SpyEvent::Error(PacketEvent::new(
-                net_header,
-                transport_header,
-                data,
-                session_id,
-                None,
-                None,
-            )));
+            self.events.push(SpyEvent::Error);
 
             InterceptVerdict::Accept
         }

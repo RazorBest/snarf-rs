@@ -139,8 +139,9 @@ pub type TcpTrackerUpdateResult<'a> = (
     bool,
 );
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum TcpPeerState {
+    #[default]
     SessionInit,
     SynSent(u32),
     Established,
@@ -149,41 +150,34 @@ pub enum TcpPeerState {
 }
 
 impl TcpPeerState {
-    pub fn new() -> Self {
-        Self::SessionInit
-    }
-
     pub fn is_init(&self) -> bool {
-        return matches!(self, Self::SessionInit);
+        matches!(self, Self::SessionInit)
     }
 
     pub fn is_established(&self) -> bool {
-        return matches!(self, Self::Established);
+        matches!(self, Self::Established)
     }
 
     pub fn is_fin(&self) -> bool {
-        return matches!(self, Self::SessionFin);
+        matches!(self, Self::SessionFin)
     }
 
     pub fn is_closed(&self) -> bool {
-        return matches!(self, Self::SessionClosed);
+        matches!(self, Self::SessionClosed)
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum TcpPeerRecvState {
+    #[default]
     RecvInit,
     RecvSynSeq(u32),
     RecvDone,
 }
 
 impl TcpPeerRecvState {
-    pub fn new() -> Self {
-        Self::RecvInit
-    }
-
     pub fn is_init(&self) -> bool {
-        return matches!(self, Self::RecvInit);
+        matches!(self, Self::RecvInit)
     }
 }
 
@@ -206,8 +200,8 @@ where
 {
     pub fn new() -> Self {
         Self {
-            state: TcpPeerState::new(),
-            recv_state: TcpPeerRecvState::new(),
+            state: TcpPeerState::default(),
+            recv_state: TcpPeerRecvState::default(),
 
             buffer: CircularSeqBuffer::new(2),
             future: vec![],
@@ -268,7 +262,7 @@ where
         let data_len = data.len() as i64;
         let curr_seq = self.buffer.seq as i64;
 
-        if (flags & SYN_MASK) != 0 && data.len() > 0 {
+        if (flags & SYN_MASK) != 0 && !data.is_empty() {
             return Err(NonZeroDataLengthInSyn);
         }
 
@@ -822,8 +816,8 @@ mod helpers_test_tcp_peer_tracker {
     pub fn tcp_peer_tracker() -> TcpPeerTracker<Vec<u8>> {
         set_global_config(100);
         TcpPeerTracker {
-            state: TcpPeerState::new(),
-            recv_state: TcpPeerRecvState::new(),
+            state: TcpPeerState::default(),
+            recv_state: TcpPeerRecvState::default(),
 
             // The BUFFER_SIZE referenced here is redefined in the test context
             buffer: CircularSeqBuffer::new(*BUFFER_SIZE.read().unwrap()),
