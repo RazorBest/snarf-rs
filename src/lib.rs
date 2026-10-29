@@ -278,7 +278,7 @@ where
                 msg = self.get_next_msg() => {
                     msg
                 },
-                _ = tokio::spawn(while_running) => {
+                _ = while_running => {
                     // Trigger when `running` is set to false
                     return Ok(());
                 },
