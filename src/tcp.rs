@@ -24,6 +24,7 @@ pub enum SnarfTcpError {
     FutureQueueOverflow,
     AckNotFoundInSyn,
     InvalidAckInSyn,
+    NonZeroDataLengthInSyn,
 }
 use SnarfTcpError::*;
 
@@ -265,6 +266,10 @@ where
         let buffer_len = self.buffer.len() as i64;
         let data_len = data.len() as i64;
         let curr_seq = self.buffer.seq as i64;
+
+        if (flags & SYN_MASK) != 0 && data.len() > 0 {
+            return Err(NonZeroDataLengthInSyn);
+        }
 
         if (flags & SYN_MASK) != 0 && (!self.state.is_established()) {
             if let RecvSynSeq(recv_syn_seq) = self.recv_state.clone() {
