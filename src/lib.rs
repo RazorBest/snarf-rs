@@ -33,10 +33,19 @@ pub enum SnarfInterceptVerdict<RF> {
     Keep,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum InterceptVerdict {
     Accept,
     Drop,
+}
+
+impl InterceptVerdict {
+    fn to_snarf_intercept_verdict<RF>(self, rf: RF) -> SnarfInterceptVerdict<RF> {
+        match self {
+            InterceptVerdict::Accept => SnarfInterceptVerdict::Accept(rf),
+            InterceptVerdict::Drop => SnarfInterceptVerdict::Drop(rf),
+        }
+    }
 }
 
 pub trait NetworkSnarfHandler<RF> {
@@ -63,7 +72,6 @@ pub trait ApplicationDataSnarfHandler {
         counter: i64,
         data: &mut [u8],
     ) -> InterceptVerdict;
-
     fn close(&mut self, session_id: u64, is_client: bool);
 }
 
@@ -92,6 +100,14 @@ pub trait TransportSnarfSpy {
         verdict: &InterceptVerdict,
     );
     fn close(&mut self, is_client: bool, session_id: u64);
+    fn error(
+        &mut self,
+        net_header: &[u8],
+        transport_header: &[u8],
+        data: &[u8],
+        session_id: u64,
+        err: SnarfTcpError,
+    ) -> InterceptVerdict;
 }
 
 impl TransportSnarfSpy for NoSpy {
@@ -114,6 +130,16 @@ impl TransportSnarfSpy for NoSpy {
     ) {
     }
     fn close(&mut self, _is_client: bool, _session_id: u64) {}
+    fn error(
+        &mut self,
+        _net_header: &[u8],
+        _transport_header: &[u8],
+        _data: &[u8],
+        _session_id: u64,
+        err: SnarfTcpError,
+    ) -> InterceptVerdict {
+        panic!("Error: {:?}", err);
+    }
 }
 
 #[derive(Clone)]
@@ -585,6 +611,18 @@ where
         self.transport_spy
             .before(net_header, tcp_header, data, session_id);
 
+        let res = session.read_tcp_packet(src_net, src_port, tcp_payload);
+        let Ok(res) = res else {
+            let (tcp_header, data) = tcp_payload[..].split_at(header_len);
+            let verdict = self.transport_spy.error(
+                net_header,
+                tcp_header,
+                data,
+                session_id,
+                res.err().unwrap(),
+            );
+            return vec![verdict.to_snarf_intercept_verdict(rf)];
+        };
         let (
             mut is_client,
             mut retransmitted,
@@ -593,9 +631,7 @@ where
             mut is_future,
             mut closing,
             new_connection,
-        ) = session
-            .read_tcp_packet(src_net, src_port, tcp_payload)
-            .unwrap();
+        ) = res;
 
         if new_connection {
             verdicts.append(&mut self.drain_futures_from_last_session());
@@ -605,9 +641,20 @@ where
             session = &mut result.session;
             session_id = result.session_id;
 
-            (is_client, retransmitted, writable, _, is_future, closing, _) = session
-                .read_tcp_packet(src_net, src_port, tcp_payload)
-                .unwrap();
+            let res = session.read_tcp_packet(src_net, src_port, tcp_payload);
+            let (tcp_header, data) = tcp_payload[..].split_at(header_len);
+            let Ok(res) = res else {
+                let verdict = self.transport_spy.error(
+                    net_header,
+                    tcp_header,
+                    data,
+                    session_id,
+                    res.err().unwrap(),
+                );
+                return vec![verdict.to_snarf_intercept_verdict(rf)];
+            };
+
+            (is_client, retransmitted, writable, _, is_future, closing, _) = res;
         };
 
         self.last_is_client = is_client;
@@ -689,14 +736,7 @@ where
             self.app_data_handler.close(session_id, true);
         }
 
-        match this_verdict {
-            InterceptVerdict::Accept => {
-                verdicts.push(SnarfInterceptVerdict::Accept(rf));
-            }
-            InterceptVerdict::Drop => {
-                verdicts.push(SnarfInterceptVerdict::Drop(rf));
-            }
-        }
+        verdicts.push(this_verdict.to_snarf_intercept_verdict(rf));
 
         verdicts
     }
