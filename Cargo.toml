@@ -1,10 +1,10 @@
 [package]
-name = "snarf-rs"
+name = "slapp"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "snarf"
+name = "slapp"
 path = "src/lib.rs"
 
 [dependencies]

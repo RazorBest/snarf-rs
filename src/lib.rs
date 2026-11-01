@@ -21,13 +21,13 @@ use etherparse::{
 };
 use tokio::io::unix::AsyncFd;
 
-use crate::tcp::{SnarfTcpError, TcpSession};
+use crate::tcp::{SlappTcpError, TcpSession};
 use crate::tcp_util::{
     TCP_DSTPORT_OFFSET, TCP_SEQ_OFFSET, TCP_SRCPORT_OFFSET, tcp_header_len,
     update_checksum_tcp_ipv4,
 };
 
-pub enum SnarfInterceptVerdict<RF> {
+pub enum SlappInterceptVerdict<RF> {
     Accept(RF),
     Drop(RF),
     Keep,
@@ -40,19 +40,19 @@ pub enum InterceptVerdict {
 }
 
 impl InterceptVerdict {
-    fn into_snarf_intercept_verdict<RF>(self, rf: RF) -> SnarfInterceptVerdict<RF> {
+    fn into_slapp_intercept_verdict<RF>(self, rf: RF) -> SlappInterceptVerdict<RF> {
         match self {
-            InterceptVerdict::Accept => SnarfInterceptVerdict::Accept(rf),
-            InterceptVerdict::Drop => SnarfInterceptVerdict::Drop(rf),
+            InterceptVerdict::Accept => SlappInterceptVerdict::Accept(rf),
+            InterceptVerdict::Drop => SlappInterceptVerdict::Drop(rf),
         }
     }
 }
 
-pub trait NetworkSnarfHandler<RF> {
-    fn on_payload(&mut self, rf: RF) -> Vec<SnarfInterceptVerdict<RF>>;
+pub trait NetworkSlappHandler<RF> {
+    fn on_payload(&mut self, rf: RF) -> Vec<SlappInterceptVerdict<RF>>;
 }
 
-pub trait TransportSnarfHandler<NetAddr, RF> {
+pub trait TransportSlappHandler<NetAddr, RF> {
     /*
      * Handles a TCP packet. Must guarantee that the packet is eventually
      * returned back in the verdict vector after subsequent calls.*/
@@ -61,10 +61,10 @@ pub trait TransportSnarfHandler<NetAddr, RF> {
         src_ip: NetAddr,
         dst_ip: NetAddr,
         rf: RF,
-    ) -> Vec<SnarfInterceptVerdict<RF>>;
+    ) -> Vec<SlappInterceptVerdict<RF>>;
 }
 
-pub trait ApplicationDataSnarfHandler {
+pub trait ApplicationDataSlappHandler {
     fn on_data(
         &mut self,
         session_id: u64,
@@ -78,17 +78,17 @@ pub trait ApplicationDataSnarfHandler {
 #[derive(Default)]
 pub struct NoSpy;
 
-pub trait NetworkSnarfSpy {
+pub trait NetworkSlappSpy {
     fn before(&mut self, net_header: &[u8], data: &[u8]);
     fn after(&mut self, net_header: &[u8], data: &[u8], verdict: &InterceptVerdict);
 }
 
-impl NetworkSnarfSpy for NoSpy {
+impl NetworkSlappSpy for NoSpy {
     fn before(&mut self, _net_header: &[u8], _data: &[u8]) {}
     fn after(&mut self, _net_header: &[u8], _data: &[u8], _verdict: &InterceptVerdict) {}
 }
 
-pub trait TransportSnarfSpy {
+pub trait TransportSlappSpy {
     fn before(&mut self, net_header: &[u8], transport_header: &[u8], data: &[u8], session_id: u64);
     fn after(
         &mut self,
@@ -106,11 +106,11 @@ pub trait TransportSnarfSpy {
         transport_header: &[u8],
         data: &[u8],
         session_id: u64,
-        err: SnarfTcpError,
+        err: SlappTcpError,
     ) -> InterceptVerdict;
 }
 
-impl TransportSnarfSpy for NoSpy {
+impl TransportSlappSpy for NoSpy {
     fn before(
         &mut self,
         _net_header: &[u8],
@@ -136,48 +136,48 @@ impl TransportSnarfSpy for NoSpy {
         _transport_header: &[u8],
         _data: &[u8],
         _session_id: u64,
-        err: SnarfTcpError,
+        err: SlappTcpError,
     ) -> InterceptVerdict {
         panic!("Error: {:?}", err);
     }
 }
 
 #[derive(Clone)]
-pub struct SnarfNfqNetOptions {
+pub struct SlappNfqNetOptions {
     queue_num: u16,
 }
 
-impl SnarfNfqNetOptions {
+impl SlappNfqNetOptions {
     pub fn open_from_handler<NetHandler>(
         &self,
         net_handler: NetHandler,
-    ) -> Result<SnarfNfqNet<NetHandler>, Box<dyn Error>>
+    ) -> Result<SlappNfqNet<NetHandler>, Box<dyn Error>>
     where
-        NetHandler: NetworkSnarfHandler<nfq::Message>,
+        NetHandler: NetworkSlappHandler<nfq::Message>,
     {
-        SnarfNfqNet::new_from_handler(self, net_handler)
+        SlappNfqNet::new_from_handler(self, net_handler)
     }
 
-    pub fn open<NetHandler>(&self) -> Result<SnarfNfqNet<NetHandler>, Box<dyn Error>>
+    pub fn open<NetHandler>(&self) -> Result<SlappNfqNet<NetHandler>, Box<dyn Error>>
     where
-        NetHandler: NetworkSnarfHandler<nfq::Message> + Default,
+        NetHandler: NetworkSlappHandler<nfq::Message> + Default,
     {
-        SnarfNfqNet::new_from_handler(self, NetHandler::default())
+        SlappNfqNet::new_from_handler(self, NetHandler::default())
     }
 }
 
-pub struct SnarfNfqNet<NetHandler>
+pub struct SlappNfqNet<NetHandler>
 where
-    NetHandler: NetworkSnarfHandler<nfq::Message>,
+    NetHandler: NetworkSlappHandler<nfq::Message>,
 {
     pub queue: nfq::Queue,
     pub async_fd: AsyncFd<RawFd>,
     pub net_handler: NetHandler,
 }
 
-impl<NetHandler> SnarfNfqNet<NetHandler>
+impl<NetHandler> SlappNfqNet<NetHandler>
 where
-    NetHandler: NetworkSnarfHandler<nfq::Message>,
+    NetHandler: NetworkSlappHandler<nfq::Message>,
 {
     /// Creates a new `Self` instance from `NetHandler`.
     ///
@@ -186,7 +186,7 @@ where
     /// * `opts` - Configuration options.
     /// * `net_handler` - An instance that handles network packets.
     pub fn new_from_handler(
-        opts: &SnarfNfqNetOptions,
+        opts: &SlappNfqNetOptions,
         net_handler: NetHandler,
     ) -> Result<Self, Box<dyn Error>> {
         let mut queue = nfq::Queue::open()?;
@@ -297,12 +297,12 @@ where
 
             for vd in verdicts {
                 let msg = match vd {
-                    SnarfInterceptVerdict::Accept(mut msg) => {
+                    SlappInterceptVerdict::Accept(mut msg) => {
                         msg.set_verdict(nfq::Verdict::Accept);
 
                         msg
                     }
-                    SnarfInterceptVerdict::Drop(mut msg) => {
+                    SlappInterceptVerdict::Drop(mut msg) => {
                         msg.set_verdict(nfq::Verdict::Drop);
 
                         msg
@@ -323,19 +323,19 @@ where
 type Ipv4Type = [u8; 4];
 
 #[derive(Default)]
-pub struct SnarfNfqIpv4<TH, NetSpy>
+pub struct SlappNfqIpv4<TH, NetSpy>
 where
-    TH: TransportSnarfHandler<Ipv4Type, NfqMessageParent>,
-    NetSpy: NetworkSnarfSpy,
+    TH: TransportSlappHandler<Ipv4Type, NfqMessageParent>,
+    NetSpy: NetworkSlappSpy,
 {
     transport_handler: TH,
     net_spy: NetSpy,
 }
 
-impl<TH, NetSpy> SnarfNfqIpv4<TH, NetSpy>
+impl<TH, NetSpy> SlappNfqIpv4<TH, NetSpy>
 where
-    TH: TransportSnarfHandler<Ipv4Type, NfqMessageParent>,
-    NetSpy: NetworkSnarfSpy,
+    TH: TransportSlappHandler<Ipv4Type, NfqMessageParent>,
+    NetSpy: NetworkSlappSpy,
 {
     pub fn new(transport_handler: TH, net_spy: NetSpy) -> Self {
         Self {
@@ -345,15 +345,15 @@ where
     }
 }
 
-impl<NetSpy, TH> NetworkSnarfHandler<nfq::Message> for SnarfNfqIpv4<TH, NetSpy>
+impl<NetSpy, TH> NetworkSlappHandler<nfq::Message> for SlappNfqIpv4<TH, NetSpy>
 where
-    TH: TransportSnarfHandler<Ipv4Type, NfqMessageParent>,
-    NetSpy: NetworkSnarfSpy,
+    TH: TransportSlappHandler<Ipv4Type, NfqMessageParent>,
+    NetSpy: NetworkSlappSpy,
 {
-    fn on_payload(&mut self, mut rf: nfq::Message) -> Vec<SnarfInterceptVerdict<nfq::Message>> {
+    fn on_payload(&mut self, mut rf: nfq::Message) -> Vec<SlappInterceptVerdict<nfq::Message>> {
         let payload = rf.get_payload_mut();
         let Ok(parsed) = SlicedPacket::from_ip(payload) else {
-            return vec![SnarfInterceptVerdict::Accept(rf)];
+            return vec![SlappInterceptVerdict::Accept(rf)];
         };
 
         let (src_ip, dst_ip, protocol, ip_header_len) = match &parsed.net {
@@ -388,28 +388,28 @@ where
             self.transport_handler
                 .on_transport_packet(src_ip, dst_ip, msg_parent)
         } else {
-            return vec![SnarfInterceptVerdict::Accept(rf)];
+            return vec![SlappInterceptVerdict::Accept(rf)];
         };
 
         let mut upstream_verdicts = vec![];
         for verdict in verdicts {
             let up_verdict = match verdict {
-                SnarfInterceptVerdict::Accept(mut rf) => {
+                SlappInterceptVerdict::Accept(mut rf) => {
                     let (ip_header, tcp_payload) = rf.split();
                     update_checksum_tcp_ipv4(ip_header, tcp_payload);
                     self.net_spy
                         .after(ip_header, tcp_payload, &InterceptVerdict::Accept);
 
-                    SnarfInterceptVerdict::Accept(rf.message)
+                    SlappInterceptVerdict::Accept(rf.message)
                 }
-                SnarfInterceptVerdict::Drop(mut rf) => {
+                SlappInterceptVerdict::Drop(mut rf) => {
                     let (ip_header, tcp_payload) = rf.split();
                     self.net_spy
                         .after(ip_header, tcp_payload, &InterceptVerdict::Drop);
 
-                    SnarfInterceptVerdict::Drop(rf.message)
+                    SlappInterceptVerdict::Drop(rf.message)
                 }
-                SnarfInterceptVerdict::Keep => SnarfInterceptVerdict::Keep,
+                SlappInterceptVerdict::Keep => SlappInterceptVerdict::Keep,
             };
 
             upstream_verdicts.push(up_verdict);
@@ -536,10 +536,10 @@ impl TransportPacketParent for NfqMessageParent {
 }
 
 #[derive(Debug, Default)]
-pub struct SnarfTcp<AH, TSpy, NetAddr, RF>
+pub struct SlappTcp<AH, TSpy, NetAddr, RF>
 where
-    AH: ApplicationDataSnarfHandler,
-    TSpy: TransportSnarfSpy,
+    AH: ApplicationDataSlappHandler,
+    TSpy: TransportSlappSpy,
     NetAddr: Copy + Hash + Ord + Default,
     RF: TransportPacketParent,
 {
@@ -550,10 +550,10 @@ where
     pub last_is_client: bool,
 }
 
-impl<AH, TSpy, NetAddr, RF> SnarfTcp<AH, TSpy, NetAddr, RF>
+impl<AH, TSpy, NetAddr, RF> SlappTcp<AH, TSpy, NetAddr, RF>
 where
-    AH: ApplicationDataSnarfHandler,
-    TSpy: TransportSnarfSpy,
+    AH: ApplicationDataSlappHandler,
+    TSpy: TransportSlappSpy,
     NetAddr: Copy + Hash + Ord + Default,
     RF: TransportPacketParent,
 {
@@ -578,11 +578,11 @@ where
     }
 }
 
-impl<NetAddr, TSpy, AH, RF> TransportSnarfHandler<NetAddr, RF> for SnarfTcp<AH, TSpy, NetAddr, RF>
+impl<NetAddr, TSpy, AH, RF> TransportSlappHandler<NetAddr, RF> for SlappTcp<AH, TSpy, NetAddr, RF>
 where
     NetAddr: Copy + Hash + Ord + Default,
-    TSpy: TransportSnarfSpy,
-    AH: ApplicationDataSnarfHandler,
+    TSpy: TransportSlappSpy,
+    AH: ApplicationDataSlappHandler,
     RF: TransportPacketParent,
 {
     fn on_transport_packet(
@@ -590,7 +590,7 @@ where
         src_net: NetAddr,
         dst_net: NetAddr,
         mut rf: RF,
-    ) -> Vec<SnarfInterceptVerdict<RF>> {
+    ) -> Vec<SlappInterceptVerdict<RF>> {
         let mut verdicts = vec![];
         let (net_header, tcp_payload) = rf.split();
         let src_port = u16::from_be_bytes([
@@ -625,7 +625,7 @@ where
                 session_id,
                 res.err().unwrap(),
             );
-            return vec![verdict.into_snarf_intercept_verdict(rf)];
+            return vec![verdict.into_slapp_intercept_verdict(rf)];
         };
         let (
             mut is_client,
@@ -655,7 +655,7 @@ where
                     session_id,
                     res.err().unwrap(),
                 );
-                return vec![verdict.into_snarf_intercept_verdict(rf)];
+                return vec![verdict.into_slapp_intercept_verdict(rf)];
             };
 
             (is_client, retransmitted, writable, _, is_future, closing, _) = res;
@@ -671,7 +671,7 @@ where
             if is_future {
                 let res = session.add_future_payload(is_client, rf);
                 match res {
-                    Err((rf, SnarfTcpError::FutureQueueOverflow)) => {
+                    Err((rf, SlappTcpError::FutureQueueOverflow)) => {
                         remove_session = true;
                         (rf, InterceptVerdict::Drop)
                     }
@@ -679,7 +679,7 @@ where
                         panic!("{:?}", err);
                     }
                     _ => {
-                        return vec![SnarfInterceptVerdict::Keep];
+                        return vec![SlappInterceptVerdict::Keep];
                     }
                 }
             } else if let Some(mut writable) = writable {
@@ -740,20 +740,20 @@ where
             self.app_data_handler.close(session_id, true);
         }
 
-        verdicts.push(this_verdict.into_snarf_intercept_verdict(rf));
+        verdicts.push(this_verdict.into_slapp_intercept_verdict(rf));
 
         verdicts
     }
 }
 
-impl<AH, TSpy, NetAddr, RF> SnarfTcp<AH, TSpy, NetAddr, RF>
+impl<AH, TSpy, NetAddr, RF> SlappTcp<AH, TSpy, NetAddr, RF>
 where
-    AH: ApplicationDataSnarfHandler,
-    TSpy: TransportSnarfSpy,
+    AH: ApplicationDataSlappHandler,
+    TSpy: TransportSlappSpy,
     NetAddr: Copy + Hash + Ord + Default,
     RF: TransportPacketParent,
 {
-    fn transport_packet_verdict_kept(&mut self) -> Vec<SnarfInterceptVerdict<RF>> {
+    fn transport_packet_verdict_kept(&mut self) -> Vec<SlappInterceptVerdict<RF>> {
         let Some(&mut TcpSessionWithId {
             ref mut session,
             session_id,
@@ -794,13 +794,13 @@ where
                 &InterceptVerdict::Accept,
             );
 
-            upstream_verdicts.push(SnarfInterceptVerdict::Accept(parent));
+            upstream_verdicts.push(SlappInterceptVerdict::Accept(parent));
         }
 
         upstream_verdicts
     }
 
-    fn drain_futures_from_last_session(&mut self) -> Vec<SnarfInterceptVerdict<RF>> {
+    fn drain_futures_from_last_session(&mut self) -> Vec<SlappInterceptVerdict<RF>> {
         let Some(&mut TcpSessionWithId {
             ref mut session,
             session_id,
@@ -828,7 +828,7 @@ where
                 &InterceptVerdict::Drop,
             );
 
-            upstream_verdicts.push(SnarfInterceptVerdict::Drop(parent));
+            upstream_verdicts.push(SlappInterceptVerdict::Drop(parent));
         }
 
         let is_client = false;
@@ -848,42 +848,42 @@ where
                 &InterceptVerdict::Drop,
             );
 
-            upstream_verdicts.push(SnarfInterceptVerdict::Drop(parent));
+            upstream_verdicts.push(SlappInterceptVerdict::Drop(parent));
         }
 
         upstream_verdicts
     }
 }
 
-pub type SnarfNfqIpv4Tcp<AH, NetSpy, TSpy> =
-    SnarfNfqNet<SnarfNfqIpv4<SnarfTcp<AH, TSpy, Ipv4Type, NfqMessageParent>, NetSpy>>;
+pub type SlappNfqIpv4Tcp<AH, NetSpy, TSpy> =
+    SlappNfqNet<SlappNfqIpv4<SlappTcp<AH, TSpy, Ipv4Type, NfqMessageParent>, NetSpy>>;
 
-impl<AH, NetSpy, TSpy> SnarfNfqIpv4Tcp<AH, NetSpy, TSpy>
+impl<AH, NetSpy, TSpy> SlappNfqIpv4Tcp<AH, NetSpy, TSpy>
 where
-    AH: ApplicationDataSnarfHandler,
-    NetSpy: NetworkSnarfSpy,
-    TSpy: TransportSnarfSpy,
+    AH: ApplicationDataSlappHandler,
+    NetSpy: NetworkSlappSpy,
+    TSpy: TransportSlappSpy,
 {
     pub fn new_from_handlers(
-        opts: &SnarfNfqNetOptions,
+        opts: &SlappNfqNetOptions,
         app_handler: AH,
         net_spy: NetSpy,
         transport_spy: TSpy,
     ) -> Result<Self, Box<dyn Error>> {
-        let tcp = SnarfTcp::new_from(app_handler, transport_spy);
-        let ip = SnarfNfqIpv4::new(tcp, net_spy);
+        let tcp = SlappTcp::new_from(app_handler, transport_spy);
+        let ip = SlappNfqIpv4::new(tcp, net_spy);
 
-        SnarfNfqNet::new_from_handler(opts, ip)
+        SlappNfqNet::new_from_handler(opts, ip)
     }
 }
 
-impl<AH, NetSpy, TSpy> SnarfNfqIpv4Tcp<AH, NetSpy, TSpy>
+impl<AH, NetSpy, TSpy> SlappNfqIpv4Tcp<AH, NetSpy, TSpy>
 where
-    AH: ApplicationDataSnarfHandler + Default,
-    NetSpy: NetworkSnarfSpy + Default,
-    TSpy: TransportSnarfSpy + Default,
+    AH: ApplicationDataSlappHandler + Default,
+    NetSpy: NetworkSlappSpy + Default,
+    TSpy: TransportSlappSpy + Default,
 {
-    pub fn new(opts: &SnarfNfqNetOptions) -> Result<Self, Box<dyn Error>> {
+    pub fn new(opts: &SlappNfqNetOptions) -> Result<Self, Box<dyn Error>> {
         let app_handler = AH::default();
         let net_spy = NetSpy::default();
         let transport_spy = TSpy::default();
@@ -891,28 +891,28 @@ where
     }
 }
 
-pub struct SnarfNfqIpv4TcpOptions {
+pub struct SlappNfqIpv4TcpOptions {
     pub queue_num: u16,
 }
 
-impl From<&SnarfNfqIpv4TcpOptions> for SnarfNfqNetOptions {
-    fn from(obj: &SnarfNfqIpv4TcpOptions) -> Self {
+impl From<&SlappNfqIpv4TcpOptions> for SlappNfqNetOptions {
+    fn from(obj: &SlappNfqIpv4TcpOptions) -> Self {
         Self {
             queue_num: obj.queue_num,
         }
     }
 }
 
-impl SnarfNfqIpv4TcpOptions {
+impl SlappNfqIpv4TcpOptions {
     pub fn open<AH, NetSpy, TSpy>(
         &self,
-    ) -> Result<SnarfNfqIpv4Tcp<AH, NetSpy, TSpy>, Box<dyn Error>>
+    ) -> Result<SlappNfqIpv4Tcp<AH, NetSpy, TSpy>, Box<dyn Error>>
     where
-        AH: ApplicationDataSnarfHandler + Default,
-        NetSpy: NetworkSnarfSpy + Default,
-        TSpy: TransportSnarfSpy + Default,
+        AH: ApplicationDataSlappHandler + Default,
+        NetSpy: NetworkSlappSpy + Default,
+        TSpy: TransportSlappSpy + Default,
     {
-        SnarfNfqIpv4Tcp::new(&self.into())
+        SlappNfqIpv4Tcp::new(&self.into())
     }
 
     pub fn open_from<AH, NetSpy, TSpy>(
@@ -920,18 +920,18 @@ impl SnarfNfqIpv4TcpOptions {
         app_handler: AH,
         net_spy: NetSpy,
         transport_spy: TSpy,
-    ) -> Result<SnarfNfqIpv4Tcp<AH, NetSpy, TSpy>, Box<dyn Error>>
+    ) -> Result<SlappNfqIpv4Tcp<AH, NetSpy, TSpy>, Box<dyn Error>>
     where
-        AH: ApplicationDataSnarfHandler,
-        NetSpy: NetworkSnarfSpy,
-        TSpy: TransportSnarfSpy,
+        AH: ApplicationDataSlappHandler,
+        NetSpy: NetworkSlappSpy,
+        TSpy: TransportSlappSpy,
     {
-        SnarfNfqIpv4Tcp::new_from_handlers(&self.into(), app_handler, net_spy, transport_spy)
+        SlappNfqIpv4Tcp::new_from_handlers(&self.into(), app_handler, net_spy, transport_spy)
     }
 }
 
 #[cfg(test)]
-mod test_snarf_tcp {
+mod test_slapp_tcp {
     use super::*;
     use crate::ipv4_util::ipv4_header_len;
     use crate::tcp_util::{
@@ -943,7 +943,7 @@ mod test_snarf_tcp {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct AHDummy {}
-    impl ApplicationDataSnarfHandler for AHDummy {
+    impl ApplicationDataSlappHandler for AHDummy {
         fn on_data(
             &mut self,
             _session_id: u64,
@@ -1000,7 +1000,7 @@ mod test_snarf_tcp {
         events: Vec<SpyEvent>,
     }
 
-    impl TransportSnarfSpy for TSpy {
+    impl TransportSlappSpy for TSpy {
         fn before(
             &mut self,
             net_header: &[u8],
@@ -1051,7 +1051,7 @@ mod test_snarf_tcp {
             _transport_header: &[u8],
             _data: &[u8],
             _session_id: u64,
-            _err: SnarfTcpError,
+            _err: SlappTcpError,
         ) -> InterceptVerdict {
             self.events.push(SpyEvent::Error);
 
@@ -1059,7 +1059,7 @@ mod test_snarf_tcp {
         }
     }
 
-    impl TransportSnarfSpy for Rc<RefCell<TSpy>> {
+    impl TransportSlappSpy for Rc<RefCell<TSpy>> {
         fn before(
             &mut self,
             net_header: &[u8],
@@ -1097,7 +1097,7 @@ mod test_snarf_tcp {
             transport_header: &[u8],
             data: &[u8],
             session_id: u64,
-            err: SnarfTcpError,
+            err: SlappTcpError,
         ) -> InterceptVerdict {
             self.borrow_mut()
                 .error(net_header, transport_header, data, session_id, err)
@@ -1128,7 +1128,7 @@ mod test_snarf_tcp {
         }
     }
 
-    type THandler = SnarfTcp<AHDummy, Rc<RefCell<TSpy>>, Ipv4Type, TParent>;
+    type THandler = SlappTcp<AHDummy, Rc<RefCell<TSpy>>, Ipv4Type, TParent>;
 
     fn new_transport_handler() -> THandler {
         let tspy = Rc::new(RefCell::new(TSpy::default()));
@@ -1219,10 +1219,10 @@ mod test_snarf_tcp {
             "The tcp handler must return a verdict"
         );
         assert!(
-            matches!(verdicts[0], SnarfInterceptVerdict::Accept(..)),
+            matches!(verdicts[0], SlappInterceptVerdict::Accept(..)),
             "The tcp handler's verdict must be ACCEPT"
         );
-        let SnarfInterceptVerdict::Accept(rf) = &verdicts[0] else {
+        let SlappInterceptVerdict::Accept(rf) = &verdicts[0] else {
             panic!("The tcp handler's verdict must be ACCEPT");
         };
         assert_eq!(
@@ -1264,10 +1264,10 @@ mod test_snarf_tcp {
             "The tcp handler must return a verdict"
         );
         assert!(
-            matches!(verdicts[0], SnarfInterceptVerdict::Accept(..)),
+            matches!(verdicts[0], SlappInterceptVerdict::Accept(..)),
             "The tcp handler's verdict must be ACCEPT"
         );
-        let SnarfInterceptVerdict::Accept(rf) = &verdicts[0] else {
+        let SlappInterceptVerdict::Accept(rf) = &verdicts[0] else {
             panic!("The tcp handler's verdict must be ACCEPT");
         };
         assert_eq!(
