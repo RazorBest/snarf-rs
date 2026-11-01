@@ -99,9 +99,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "nfq"
+name = "nfq-razor-temp-release"
 version = "0.2.6"
-source = "git+https://github.com/nbdd0121/nfq-rs#fc838b4d8e4dcade5324cf1719a4f05122754019"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7409e32509ccc88eb12d02073d3d72f86b407c8ee7893bc8b5e42cd301e7baf"
 dependencies = [
  "bytes",
  "libc",
@@ -213,7 +214,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "etherparse",
- "nfq",
+ "nfq-razor-temp-release",
  "nix",
  "tokio",
 ]
