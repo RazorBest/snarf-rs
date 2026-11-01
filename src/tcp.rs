@@ -19,7 +19,7 @@ static BUFFER_SIZE: RwLock<usize> = RwLock::new(65535 * 32);
 const MAX_FUTURE_SIZE: usize = 65535 * 32;
 
 #[derive(Debug, Clone)]
-pub enum SnarfTcpError {
+pub enum SlappTcpError {
     PacketTooBigError,
     PacketOutsideWindow,
     FutureQueueOverflow,
@@ -27,9 +27,9 @@ pub enum SnarfTcpError {
     InvalidAckInSyn,
     NonZeroDataLengthInSyn,
 }
-use SnarfTcpError::*;
+use SlappTcpError::*;
 
-type Result<T> = std::result::Result<T, SnarfTcpError>;
+type Result<T> = std::result::Result<T, SlappTcpError>;
 
 #[derive(Debug)]
 pub struct FuturePacket<T> {
@@ -499,7 +499,7 @@ where
         self.future.sort();
     }
 
-    pub fn add_future_payload(&mut self, mut rf: RF) -> std::result::Result<(), (RF, SnarfTcpError)>
+    pub fn add_future_payload(&mut self, mut rf: RF) -> std::result::Result<(), (RF, SlappTcpError)>
     where
         RF: TransportPacketParent,
     {
@@ -706,7 +706,7 @@ where
         &mut self,
         is_client: bool,
         parent_reference: RF,
-    ) -> std::result::Result<(), (RF, SnarfTcpError)> {
+    ) -> std::result::Result<(), (RF, SlappTcpError)> {
         if is_client {
             self.src_tracker.add_future_payload(parent_reference)
         } else {
