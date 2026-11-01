@@ -2,6 +2,12 @@
 name = "slapp"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/RazorBest/slapp-rs"
+homepage = "https://github.com/RazorBest/slapp-rs"
+description = "A framework for developing MitM at the application layer"
+
 
 [lib]
 name = "slapp"
