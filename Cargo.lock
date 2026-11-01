@@ -101,7 +101,7 @@ dependencies = [
 [[package]]
 name = "nfq"
 version = "0.2.6"
-source = "git+https://github.com/RazorBest/nfq-rs.git#8c9a1138c796792e3929fc5f3e8b9bccec12f996"
+source = "git+https://github.com/nbdd0121/nfq-rs#fc838b4d8e4dcade5324cf1719a4f05122754019"
 dependencies = [
  "bytes",
  "libc",
