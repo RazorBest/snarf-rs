@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use etherparse::{
     InternetSlice::{Ipv4, Ipv6},
-    SlicedPacket,
+    IpNumber, SlicedPacket,
 };
 use tokio::io::unix::AsyncFd;
 
@@ -33,10 +33,19 @@ pub enum SnarfInterceptVerdict<RF> {
     Keep,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum InterceptVerdict {
     Accept,
     Drop,
+}
+
+impl InterceptVerdict {
+    fn into_snarf_intercept_verdict<RF>(self, rf: RF) -> SnarfInterceptVerdict<RF> {
+        match self {
+            InterceptVerdict::Accept => SnarfInterceptVerdict::Accept(rf),
+            InterceptVerdict::Drop => SnarfInterceptVerdict::Drop(rf),
+        }
+    }
 }
 
 pub trait NetworkSnarfHandler<RF> {
@@ -63,6 +72,7 @@ pub trait ApplicationDataSnarfHandler {
         counter: i64,
         data: &mut [u8],
     ) -> InterceptVerdict;
+    fn close(&mut self, session_id: u64, is_client: bool);
 }
 
 #[derive(Default)]
@@ -90,6 +100,14 @@ pub trait TransportSnarfSpy {
         verdict: &InterceptVerdict,
     );
     fn close(&mut self, is_client: bool, session_id: u64);
+    fn error(
+        &mut self,
+        net_header: &[u8],
+        transport_header: &[u8],
+        data: &[u8],
+        session_id: u64,
+        err: SnarfTcpError,
+    ) -> InterceptVerdict;
 }
 
 impl TransportSnarfSpy for NoSpy {
@@ -112,6 +130,16 @@ impl TransportSnarfSpy for NoSpy {
     ) {
     }
     fn close(&mut self, _is_client: bool, _session_id: u64) {}
+    fn error(
+        &mut self,
+        _net_header: &[u8],
+        _transport_header: &[u8],
+        _data: &[u8],
+        _session_id: u64,
+        err: SnarfTcpError,
+    ) -> InterceptVerdict {
+        panic!("Error: {:?}", err);
+    }
 }
 
 #[derive(Clone)]
@@ -250,7 +278,7 @@ where
                 msg = self.get_next_msg() => {
                     msg
                 },
-                _ = tokio::spawn(while_running) => {
+                _ = while_running => {
                     // Trigger when `running` is set to false
                     return Ok(());
                 },
@@ -328,13 +356,14 @@ where
             return vec![SnarfInterceptVerdict::Accept(rf)];
         };
 
-        let (src_ip, dst_ip, ip_header_len) = match &parsed.net {
+        let (src_ip, dst_ip, protocol, ip_header_len) = match &parsed.net {
             Some(Ipv4(ip)) => {
                 let header = ip.header();
 
                 (
                     header.source(),
                     header.destination(),
+                    header.protocol(),
                     (header.ihl() * 4) as usize,
                 )
             }
@@ -347,19 +376,22 @@ where
         };
         drop(parsed);
 
-        let (ip_header, tcp_payload) = payload.split_at(ip_header_len);
-        self.net_spy.before(ip_header, tcp_payload);
+        let (ip_header, transport_payload) = payload.split_at(ip_header_len);
 
-        let msg_parent = NfqMessageParent {
-            message: rf,
-            ip_header_len,
+        self.net_spy.before(ip_header, transport_payload);
+
+        let verdicts = if protocol == IpNumber::TCP {
+            let msg_parent = NfqMessageParent {
+                message: rf,
+                ip_header_len,
+            };
+            self.transport_handler
+                .on_transport_packet(src_ip, dst_ip, msg_parent)
+        } else {
+            return vec![SnarfInterceptVerdict::Accept(rf)];
         };
-        let verdicts = self
-            .transport_handler
-            .on_transport_packet(src_ip, dst_ip, msg_parent);
 
         let mut upstream_verdicts = vec![];
-
         for verdict in verdicts {
             let up_verdict = match verdict {
                 SnarfInterceptVerdict::Accept(mut rf) => {
@@ -583,6 +615,18 @@ where
         self.transport_spy
             .before(net_header, tcp_header, data, session_id);
 
+        let res = session.read_tcp_packet(src_net, src_port, tcp_payload);
+        let Ok(res) = res else {
+            let (tcp_header, data) = tcp_payload[..].split_at(header_len);
+            let verdict = self.transport_spy.error(
+                net_header,
+                tcp_header,
+                data,
+                session_id,
+                res.err().unwrap(),
+            );
+            return vec![verdict.into_snarf_intercept_verdict(rf)];
+        };
         let (
             mut is_client,
             mut retransmitted,
@@ -591,9 +635,7 @@ where
             mut is_future,
             mut closing,
             new_connection,
-        ) = session
-            .read_tcp_packet(src_net, src_port, tcp_payload)
-            .unwrap();
+        ) = res;
 
         if new_connection {
             verdicts.append(&mut self.drain_futures_from_last_session());
@@ -603,9 +645,20 @@ where
             session = &mut result.session;
             session_id = result.session_id;
 
-            (is_client, retransmitted, writable, _, is_future, closing, _) = session
-                .read_tcp_packet(src_net, src_port, tcp_payload)
-                .unwrap();
+            let res = session.read_tcp_packet(src_net, src_port, tcp_payload);
+            let (tcp_header, data) = tcp_payload[..].split_at(header_len);
+            let Ok(res) = res else {
+                let verdict = self.transport_spy.error(
+                    net_header,
+                    tcp_header,
+                    data,
+                    session_id,
+                    res.err().unwrap(),
+                );
+                return vec![verdict.into_snarf_intercept_verdict(rf)];
+            };
+
+            (is_client, retransmitted, writable, _, is_future, closing, _) = res;
         };
 
         self.last_is_client = is_client;
@@ -650,11 +703,21 @@ where
                 (rf, InterceptVerdict::Accept)
             };
 
+        if !remove_session {
+            verdicts.append(&mut self.transport_packet_verdict_kept());
+
+            let res =
+                Self::get_last_accessed_session(self.last_used_key, &mut self.sessions).unwrap();
+            let session = &mut res.session;
+
+            if session.is_fin() {
+                remove_session = true;
+            }
+        }
+
         if remove_session {
             verdicts.append(&mut self.drain_futures_from_last_session());
             self.sessions.remove_session(src_addr, dst_addr);
-        } else {
-            verdicts.append(&mut self.transport_packet_verdict_kept());
         }
 
         let (net_header, tcp_payload) = rf.split();
@@ -672,17 +735,12 @@ where
 
         if remove_session {
             self.transport_spy.close(false, session_id);
+            self.app_data_handler.close(session_id, false);
             self.transport_spy.close(true, session_id);
+            self.app_data_handler.close(session_id, true);
         }
 
-        match this_verdict {
-            InterceptVerdict::Accept => {
-                verdicts.push(SnarfInterceptVerdict::Accept(rf));
-            }
-            InterceptVerdict::Drop => {
-                verdicts.push(SnarfInterceptVerdict::Drop(rf));
-            }
-        }
+        verdicts.push(this_verdict.into_snarf_intercept_verdict(rf));
 
         verdicts
     }
@@ -895,6 +953,7 @@ mod test_snarf_tcp {
         ) -> InterceptVerdict {
             InterceptVerdict::Accept
         }
+        fn close(&mut self, _session_id: u64, _is_client: bool) {}
     }
 
     #[allow(dead_code)]
@@ -933,6 +992,7 @@ mod test_snarf_tcp {
         Before(PacketEvent),
         After(PacketEvent),
         Close(PacketEvent),
+        Error,
     }
 
     #[derive(Default)]
@@ -985,6 +1045,18 @@ mod test_snarf_tcp {
                 None,
             )));
         }
+        fn error(
+            &mut self,
+            _net_header: &[u8],
+            _transport_header: &[u8],
+            _data: &[u8],
+            _session_id: u64,
+            _err: SnarfTcpError,
+        ) -> InterceptVerdict {
+            self.events.push(SpyEvent::Error);
+
+            InterceptVerdict::Accept
+        }
     }
 
     impl TransportSnarfSpy for Rc<RefCell<TSpy>> {
@@ -1018,6 +1090,17 @@ mod test_snarf_tcp {
         }
         fn close(&mut self, is_client: bool, session_id: u64) {
             self.borrow_mut().close(is_client, session_id)
+        }
+        fn error(
+            &mut self,
+            net_header: &[u8],
+            transport_header: &[u8],
+            data: &[u8],
+            session_id: u64,
+            err: SnarfTcpError,
+        ) -> InterceptVerdict {
+            self.borrow_mut()
+                .error(net_header, transport_header, data, session_id, err)
         }
     }
 
